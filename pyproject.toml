@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "soc-threat-baseline"
+version = "0.1.0"
+description = "Baseline pipeline for SOC security event threat classification"
+requires-python = ">=3.10"
+dependencies = [
+  "joblib",
+  "matplotlib",
+  "numpy",
+  "pandas",
+  "pyarrow",
+  "scikit-learn",
+]
+
+[project.optional-dependencies]
+gpu = [
+  "torch>=2.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
