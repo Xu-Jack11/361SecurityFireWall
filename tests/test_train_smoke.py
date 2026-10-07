@@ -128,6 +128,7 @@ class TrainSmokeTests(unittest.TestCase):
                     feature_set="content",
                     source_label_mask=True,
                     source_mask_min_rows=2,
+                    benign_weight=10.0,
                 )
             )
 
@@ -135,6 +136,7 @@ class TrainSmokeTests(unittest.TestCase):
             self.assertEqual(submission["te0"], "benign")
             self.assertEqual(result["feature_set"], "content")
             self.assertTrue(result["source_label_mask"])
+            self.assertEqual(result["benign_weight"], 10.0)
             self.assertTrue((artifacts_dir / "source_label_mask.json").exists())
 
 

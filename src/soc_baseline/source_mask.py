@@ -14,6 +14,8 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
+from .decision import weighted_argmax
+
 
 def source_keys(df: pd.DataFrame) -> pd.Series:
     """Identify each row's log source as ``vendor_name/product_name``."""
@@ -50,11 +52,8 @@ def predict_with_source_mask(
 ) -> np.ndarray:
     """Argmax of ``predict_proba`` over the labels allowed for each row's source."""
 
-    probabilities = np.asarray(model.predict_proba(documents), dtype=np.float64)
     allowed = allowed_label_matrix(sources, mask, classes)
-    allowed[~allowed.any(axis=1)] = True
-    probabilities = np.where(allowed, probabilities, -np.inf)
-    return np.asarray(classes)[probabilities.argmax(axis=1)]
+    return weighted_argmax(model.predict_proba(documents), classes, allowed)
 
 
 def allowed_label_matrix(

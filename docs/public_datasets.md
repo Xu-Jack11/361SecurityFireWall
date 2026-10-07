@@ -23,6 +23,8 @@
 | --- | --- | --- | --- | --- |
 | `witfoo-precinct6-signals-latest.parquet` | 2,100,363 | 33 | HF `main`（refs/convert/parquet，2026-07 下载） | `7937dfda…f9ae209` |
 | `witfoo-precinct6-signals-v4.parquet` | 2,070,923 | 27 | HF 历史 commit `bd422e30`（2026-03 v4，与比赛数据同版本） | `d9b8c032…2c222c` |
+| `precinct6-v2.1.0/signals.parquet` | 2,011,674 | 38 | HF tag `v2.1.0`（commit `96311c2e`，2026-09-22，2026-10 下载） | `20d01fd2…62c6a746c` |
+| `precinct6-v2.1.0/incident_signals.parquet` | 238,511 | 38 | 同上 | `378f0a3f…8de404c6` |
 
 标签分布对照：
 
@@ -31,6 +33,8 @@
 | 仓库 `train.parquet` | 1,899,723 | 111,728 | 45,420 |
 | v4（2026-03） | 1,899,723 | 125,780 | 45,420 |
 | latest（2026-07） | 1,899,587 | 155,520 | 45,256 |
+| v2.1.0 `signals`（实时采集，原位标注） | 1,897,153 | 7,728 | 106,793 |
+| v2.1.0 `incident_signals`（历史攻击） | 0 | 238,511 | 0 |
 
 **使用注意：**
 
@@ -39,7 +43,11 @@
    标签"查答案"属于合规问题，先确认比赛规则是否允许外部数据。
 2. latest 版在 2026 年 3–5 月间经过多次重新清洗/重标注，脱敏映射已变化，
    与仓库数据只有少量行字节级一致；做记录级对齐应使用 v4 版。
-3. 补少数类样本时按 vendor/product 过滤到与比赛数据一致的组合
+3. v2（2026-09 起）**重新定义了标签**：malicious 是实时采集中被事件关联命中的
+   原位记录（主要是 Cisco ASA 和 AWS VPC Security），历史攻击单独放进
+   `incident_signals`；token 注册表也重建了。它的标签体系和比赛数据（v1 系）
+   不同，只适合做泛化测试（见 `docs/iteration_log.md` I10）。
+4. 补少数类样本时按 vendor/product 过滤到与比赛数据一致的组合
    （suspicious 主要来自 Cisco ASA Deny 与 AWS VPC REJECT 日志）。
 
 本仓库默认只使用比赛方提供的 `data/train.parquet` 训练 baseline。下面的数据集适合用于后续增强实验，例如预训练日志词表、构造攻击链特征、做跨域鲁棒性测试、扩展可视化案例或验证检测规则。不要直接把外部标签简单映射进比赛训练集；不同数据集的采集环境、字段、标签粒度和脱敏方式差异很大，直接混合可能降低线上效果。

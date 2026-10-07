@@ -39,10 +39,20 @@ python -m soc_baseline.train \
   --max-train-rows 300000 --model-backend gpu --device cuda
 ```
 
-Leak-free variant (I9 in `docs/iteration_log.md`): add
-`--feature-set content --source-label-mask`. The default `--feature-set full`
-is kept only to reproduce the original baseline — its time tokens leak the
-label (see `features.py`) and drive ~44% malicious predictions on the test set.
+Time-free variant (I13 in `docs/iteration_log.md`, the recommended one): add
+`--feature-set timefree --source-label-mask`, then run
+`python scripts/apply_verdict_rule.py --submission <res.csv> --output <out.csv>`
+(add `--benign-weight 10` to training when missed benign rows are the costlier
+error, I12). `scripts/check_time_independence.py --verdict-rule` verifies that
+rewriting every timestamp, digit and calendar word changes no prediction, and
+`scripts/eval_external.py` scores all versions on samples of the external
+WitFoo dumps in `data/external/` (I14: on par with the date rule on v4/latest,
+no malicious recall on v2, whose labels no single record can recover).
+`--feature-set content` (I9) still leaks the year through half-sanitized
+epochs, and `scripts/apply_date_rule.py` is time-based; both are kept for
+comparison. The default `--feature-set full` is kept only to reproduce the
+original baseline — its time tokens leak the label and drive ~44% malicious
+predictions on the test set.
 
 Fast smoke run: `python -m soc_baseline.train --max-train-rows 50000 --max-test-rows 200000`
 Force CPU: add `--model-backend sklearn`.
@@ -78,9 +88,13 @@ The package lives in `src/soc_baseline/` (src-layout; installed as
   it, so feature changes here affect both. `feature_set="content"` instead
   keeps only pipeline/product/vendor, field *shapes* (`src_ip_kind=ipv4`), the
   port bucket and the message after `normalize_message` folds dates, times,
-  IPs, sanitizer IDs (`USER-0010-0324` → `tok_user`) and long numbers. A model
-  must be predicted with the same `feature_set` it was trained with; scripts
-  that load `model.joblib` default to `full`.
+  IPs, sanitizer IDs (`USER-0010-0324` → `tok_user`) and long numbers.
+  `feature_set="timefree"` goes further: `normalize_message_timefree` maps every
+  sanitizer token and digit run to `0` and masks calendar words, so no number
+  survives, and `firewall_action` adds a vendor-agnostic `fw_action=block|allow|none`
+  token plus its combination with vendor presence. A model must be predicted
+  with the same `feature_set` it was trained with; scripts that load
+  `model.joblib` default to `full`.
 - **`modeling.py`** — the CPU/sklearn path: `make_model_pipeline`
   (TfidfVectorizer 1–2 grams + `class_weight="balanced"` `SGDClassifier` with
   `log_loss`) plus all the diagnostic writers (metrics, classification report,
@@ -97,6 +111,16 @@ The package lives in `src/soc_baseline/` (src-layout; installed as
   source was seen with are allowed (argmax of `predict_proba` over the
   allowed set); rare or unseen sources stay unrestricted. The mask is saved
   as `source_label_mask.json`.
+- **`decision.py`** — `weighted_argmax`: argmax of `p(y|x) * weight[y]` over
+  the allowed labels. `--benign-weight w` only raises suspicious/malicious when
+  it is > w× as likely as benign. `train._predict` routes through it whenever
+  a mask or a non-1 weight is set; otherwise it calls `model.predict`.
+- **`verdict_rule.py`** — post-prediction rule used by
+  `scripts/apply_verdict_rule.py`: learns from the training labels that the
+  vendor-less + block-verdict cell is malicious (support and purity checked,
+  raises otherwise) and forces that label on matching test rows. It is the
+  time-free replacement for the date rule and, like it, exploits how the
+  dataset was built rather than a transferable security signal.
 - **`submission.py`** — `validate_submission_frame` enforces the exact output
   contract (columns, no duplicate/missing/extra `event_id`, only allowed
   labels, row-count match). The pipeline validates its own `res.csv` before

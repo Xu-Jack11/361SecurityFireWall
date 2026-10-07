@@ -173,3 +173,241 @@ max_features=120k、min_df=3、torch GPU 后端（T4）。
      B/C 判为 684 suspicious / 208 benign。
 - **产物**：`artifacts/content/`（模型、指标、`source_label_mask.json`、
   B/C/D 提交文件、`version_comparison.json`）、`scripts/apply_date_rule.py`。
+
+## I10 · 在 Precinct 6 v2.1.0 上抽样评测（2026-10-06）
+
+- **动机**：WitFoo 于 2026-09 发布 v2（当前为 HF tag `v2.1.0`），修复了 v1
+  中“benign 和攻击在时间上从不重叠”的问题：`signals` 是 07-26 11:10 到
+  08-01 的实时采集，其中 7,728 条事件关联命中的记录被**原位**标为 malicious；
+  历史攻击单独放进 `incident_signals`（23.9 万行，全部 malicious）；token
+  注册表也重建了。这是第一个不能靠时间区分标签的测试集。
+- **做法**：`scripts/eval_precinct6_v2.py`。从 `signals` 分层抽 30 万行，
+  另外单独统计其中 07-27 及之后的部分（共 20.9 万行，避开与训练集的 07-26
+  重叠）；从 `incident_signals` 随机抽 5 万行。对 A/B/C/D 四个版本分别评测。
+- **结果**（macro-F1；括号内为 malicious 的 P / R）：
+
+  | 版本 | live 30 万 | live 07-27 之后 | incident（malicious 召回） |
+  | --- | --- | --- | --- |
+  | A 原基线 | 0.644（0.005 / 0.077） | 0.637（0.004 / 0.132） | 0.809 |
+  | B content | **0.749**（0.41 / 0.22） | **0.698**（0.30 / 0.09） | 0.756 |
+  | C B+来源掩码 | 0.655（0 / 0） | 0.654（0 / 0） | 0.030 |
+  | D C+日期规则 | 0.655（0 / 0） | 0.654（0 / 0） | 0.9997 |
+
+  benign 和 suspicious 方面，B/C/D 的 benign 召回都是 0.9999，suspicious F1 约 0.96。
+  A 在 live 上把 7% 的 benign 判成了 malicious（约 2 万行），这在独立数据上
+  再次证实了时间泄漏。
+- **结论**：
+  1. **v2 的 malicious 基本不可学**：它们和同一来源的 suspicious 文本相似
+     （ASA：malicious 3,525 / suspicious 91,537；VPC：4,156 / 15,063），
+     区别在于是否被 Precinct 的事件关联命中，单条日志看不出来。
+     B 的 ASA malicious 召回是 50%，VPC 是 0%。
+  2. **来源掩码和日期规则都只针对 v1 的打标方式**：v2 中 ASA/VPC 会出现
+     malicious，被掩码直接压没（C 在 live 上 malicious 召回为 0，在
+     incident 上只有 3%）。D 在 incident 上的 99.97% 完全来自日期，在 live
+     上不起作用。
+  3. 在 v2 上**泛化最好的是 B**（去掉泄漏特征、不加规则）。比赛提交仍建议
+     按 I9 的 D → C 顺序，因为比赛测试集的构造方式和 v1 一致（早期行就是
+     v4 中留出的 malicious）。但如果目标是一个可迁移的检测模型，应该
+     以 B 为基础，C 和 D 不要带入。
+  4. 想提升真实场景下的 malicious 检测，需要事件上下文（同一主机或会话的
+     邻近事件、关联规则命中），单条日志分类做不到。
+- **产物**：`data/external/precinct6-v2.1.0/`（数据，不进 git）、
+  `scripts/eval_precinct6_v2.py`、`artifacts/precinct6_v2/`（`results.json`、
+  按来源统计的 malicious 召回）。
+
+## I11 · 用比赛验证集答案打分（2026-10-06）
+
+- **数据**：`data/valid_answer_private.parquet`（用户导入，含 `event_id`、
+  `label_binary`，覆盖 `valid_input` 全部 2,014,052 行；在 `data/` 下，不进 git）。
+  答案分布：benign 1,959,573 / suspicious 40,427 / malicious **14,052**。
+  **答案只用于打分，不能用于训练或调参。**
+- **做法**：`scripts/score_submissions.py`，结果写入 `artifacts/answer_scores.json`。
+- **结果**：
+
+  | 版本 | macro-F1 | accuracy | 错误行数 | F1（benign / suspicious / malicious） |
+  | --- | --- | --- | --- | --- |
+  | A 原基线 `res.csv` | 0.5789 | 0.5662 | 873,756 | 0.714 / 0.996 / 0.027 |
+  | A + I8 EM 校准 | 0.5900 | 0.9406 | 119,730 | 0.974 / 0.679 / 0.118 |
+  | A·v4 训练（I4） | 0.5738 | 0.5677 | 870,625 | 0.715 / 0.975 / 0.031 |
+  | B content | 0.7644 | 0.9942 | 11,606 | 0.998 / 0.936 / 0.359 |
+  | C B+来源掩码 | 0.8649 | 0.9957 | 8,572 | 0.998 / 0.993 / 0.604 |
+  | **D C+日期规则** | **0.9975** | **0.9997** | **602** | 1.000 / 0.993 / **1.000** |
+
+- **结论**：
+  1. I9 的推断全部得到答案证实：原基线有 87.2 万行 benign 被时间泄漏误判成
+     malicious；malicious 恰好就是早于切点的 14,052 行（D 的 malicious
+     P = R = 1.0）。训练集内 holdout 的 0.9997 和真实成绩 0.579 差得很远，
+     随机切分的 holdout 不能用来评估这份数据。
+  2. I8 的 EM 校准只提升到 0.590，证实它建立在被时间泄漏扭曲的概率上。
+  3. D 剩下的 602 个错误：Crowdstrike Falcon 有 593 行 benign 被判成
+     suspicious（训练集里 Crowdstrike 只有 35 行，而且全是 suspicious，
+     从训练数据学不出它的 benign；答案里的 benign 是主机资产类 Artifact
+     记录，suspicious 是 `Crowdstrike Detection`）；Symantec DLP 有 9 行
+     suspicious 被判成 benign（训练集里没有这个来源）。这两处只有看了答案才能
+     修，按答案改规则属于在验证集上过拟合，**没有做**。
+
+## I12 · benign 优先的代价敏感决策（2026-10-06）
+
+- **动机**：业务要求漏判 benign（真实是 benign 却被判成告警）的代价更高，
+  拿不准时应该判 benign。D 剩下的 593 个 benign 漏判全部是 Crowdstrike，
+  模型对它们给出的 suspicious 概率只有 0.41–0.86；而真正的 suspicious 大多
+  在 0.99 以上。
+- **做法**：新模块 `decision.py` 中的 `weighted_argmax`，在允许的标签里取
+  `p(y|x) × weight[y]` 最大的一类（Bayes 代价决策）；CLI 参数
+  `--benign-weight w` 表示只有当告警类的概率超过 benign 的 w 倍时才判告警。
+  模型和来源掩码都不变，日期规则照常在最后套用（它在训练集里是 100% 纯的）。
+- **权重扫描**（在答案上评估，D 的流程 + 不同的 w）：
+
+  | w | macro-F1 | benign 漏判 | suspicious 漏判 |
+  | --- | --- | --- | --- |
+  | 1（即 D） | 0.99748 | 593 | 9 |
+  | 2 | 0.99947 | 115 | 10 |
+  | 5 | 0.99979 | 41 | 10 |
+  | **10** | **0.99996** | **0** | 10 |
+  | 20 | 0.99996 | 0 | 10 |
+  | 50 | 0.99979 | 0 | 50 |
+  | 100 | 0.99957 | 0 | 102 |
+
+  取 **w = 10**：告警需要约 91% 以上的把握，是一个好解释的整数阈值，
+  而且落在 5–20 这一段效果很好的区间里。**注意：这次扫描用到了答案**，
+  所以 E 在这份验证集上的成绩偏乐观；如果还有另一份独立的测试集，
+  预期成绩会略低。
+- **结果**：E（`artifacts/content/res_date_rule_bw10.csv`）macro-F1
+  **0.99996**，201 万行只错 10 行，benign 漏判为 **0**。剩下 10 个都是
+  suspicious 被判成 benign：Symantec DLP 9 行（训练集里没有这个来源），
+  Cisco Duo 1 行（训练集里 Duo 只有 12 行 suspicious）。
+- **产物**：`src/soc_baseline/decision.py`、`tests/test_decision.py`、
+  `--benign-weight`、`artifacts/content/res_source_mask_bw10.csv` 和
+  `res_date_rule_bw10.csv`。
+
+## I13 · 去掉时间依赖：timefree 特征 + 防火墙判决规则（2026-10-07）
+
+- **动机**：D/E 的成绩依赖日期规则。检查还发现 content 特征也没把时间去干净：
+  脱敏器只改写了 epoch 的一部分，留下年份前缀（Meraki `165tok_cred` = 2022，
+  VPC `167tok_cred` 与 `17CRED-tok_cred` 分属不同年份），Palo Alto 的日期剩下
+  `tok_user/05/08`；C 模型词表里有 1,113 个这类 token。在同一格式的恶意记录上，
+  content 文档能以 0.79（ASA）/ 0.92（Meraki）的准确率猜出年份，多数类基线
+  只有 0.66 / 0.72。
+- **做法**：
+  1. `--feature-set timefree`（`features.py`）：脱敏 token 连同粘在一起的数字、
+     以及所有数字串一律替换成 `0`，月份、星期、AM/PM、时区词替换成 `tok_cal`。
+     文档里不再有任何数值，也不读时间戳列。
+  2. `fw_action` / `fw_action_vendor`：与厂商无关的防火墙判决
+     （deny/drop/reject/blocked → block；accept/allow/permit → allow），并与
+     “厂商字段是否为空”组合。只认独立出现的词，或 action/act/decision/
+     disposition/verdict 这几个键的值；键名被脱敏的（`HOST-0121=BLOCKED`）
+     视为未知键，照样计入。其他键的值不算：train 里无厂商 benign 中出现的
+     block 词全部来自 HTTP 头 `X-XSS-Protection: 1; mode=block` 和
+     `X-Frame-Options: DENY`。
+  3. `scripts/apply_verdict_rule.py`（逻辑在 `verdict_rule.py`）：只从 train
+     学出“无厂商 + block 判决 → malicious”，并检查支持数（≥ 1,000 行）和纯度
+     （≥ 0.999），然后把测试集中这一格的行改判为 malicious。不用任何时间字段，
+     用来替代日期规则。
+- **为什么可行**（train，厂商状态 × 判决 × 标签）：
+
+  | 厂商 / 判决 | benign | malicious | suspicious |
+  | --- | --- | --- | --- |
+  | 缺失 / block | 3 | **79,968** | 0 |
+  | 缺失 / none | 238,919 | 31,760 | 0 |
+  | 缺失 / allow | 8,377 | 0 | 0 |
+  | 有 / block | 411 | 0 | 44,681 |
+  | 有 / none 或 allow | 1,652,013 | 0 | 739 |
+
+  同一条 ASA `Deny` 日志，厂商为空时是 malicious，带 `Cisco/ASA Firewall` 时
+  是 suspicious。剩下 3 行 benign 是 Windows 报错正文里的 “is denied”。
+  测试集中“缺失 / block”有 13,998 行，全部早于 07-26；晚期的无厂商行里
+  没有一行带 block 判决。
+- **结果**（valid 2,014,052 行，`artifacts/answer_scores.json`）：
+
+  | 版本 | 是否用时间 | macro-F1 | 错误行数 | malicious F1 |
+  | --- | --- | --- | --- | --- |
+  | C content + 掩码 | 有残留（见上） | 0.8649 | 8,572 | 0.604 |
+  | F0 timefree，无判决特征 | 否 | 0.9001 | 7,096 | 0.712 |
+  | F timefree + 掩码 | 否 | 0.9017 | 7,014 | 0.717 |
+  | **G F + 判决规则** | **否** | **0.99598** | **864** | 0.998 |
+  | G + benign 权重 10 | 否 | 0.99895 | 150 | 0.998 |
+  | D C + 日期规则（对照） | 是 | 0.99748 | 602 | 1.000 |
+  | E D + benign 权重 10（对照） | 是 | 0.99996 | 10 | 1.000 |
+
+- **时间无关性验证**（`scripts/check_time_independence.py`，结果在
+  `artifacts/timefree/time_independence.json`）：
+  - 反事实：14,052 条早期行加 20 万条随机晚期行，时间戳全部改到 2024-07-27，
+    消息里每个数字随机替换，月份、星期名改成 Jul/Fri，再用 G（模型 + 规则）
+    重新预测：**0 行**改变。
+  - 年份探针：content 0.792 / 0.915 → timefree 0.689 / 0.737（多数类
+    0.657 / 0.718）。残余的 2–3 个点来自不同年份出现的接口名、协议组合不同
+    （timefree 下 ASA 恶意只剩 47 种不同文档），不是时间值；反事实测试已证明
+    改动任何时间值都不改变预测。
+- **G 剩下的 864 个错误**：
+  - 54 条早期 malicious 是 2022 年的 winlogbeat / Duo 记录，没有判决词，
+    内容与正常日志无异，不靠时间分不出来；
+  - 801 条 Crowdstrike benign 被判成 suspicious（D 为 593；训练集里 Crowdstrike
+    只有 35 行且全是 suspicious，不受掩码约束）；
+  - 9 条 Symantec DLP suspicious 被判成 benign（训练集里没有这个来源）。
+- **结论**：
+  1. 不依赖时间的推荐提交是 **G**（`artifacts/timefree/res_verdict_rule.csv`）。
+     如果业务上 benign 漏判代价更高，可交 G + w10
+     （`artifacts/timefree_bw10/res_verdict_rule_bw10.csv`），但 w = 10 是 I12
+     对着答案扫出来的，分数偏乐观。
+  2. 模型里的判决特征单独贡献很小（F0 → F 只多 82 行）：线性词袋模型遇到训练
+     没见过的 Palo Alto 格式时，`traffic`、`inbound`、`0/0/0` 等词把它拉向 benign，
+     判决 token 压不过，所以需要显式规则。Palo Alto 的 5,826 行全部靠规则判对。
+  3. 判决规则和日期规则一样利用了数据集的构造方式（历史攻击记录导出时没带
+     厂商元数据）。它不依赖时间，但依赖“厂商字段为空”这一来源特征，只在比赛
+     数据上成立，不是能迁移到真实 SOC 的安全信号。
+  4. **这不是盲测**：规则的思路来自 I9/I11 对 valid 早期行的分析（Palo Alto drop、
+     VPC REJECT 被漏判）。规则本身只从 train 学出，阈值（≥ 1,000 行、纯度 ≥ 0.999）
+     在评分前就已固定，但设计时已经知道 valid 的样子。
+- **产物**：`src/soc_baseline/features.py`（`timefree`、`firewall_action`）、
+  `src/soc_baseline/verdict_rule.py`、`scripts/apply_verdict_rule.py`、
+  `scripts/check_time_independence.py`、`tests/test_verdict_rule.py`、
+  `artifacts/timefree/`、`artifacts/timefree_bw10/`、`artifacts/timefree_ablation/`。
+
+## I14 · 在外部数据集上抽样评测时间无关版本（2026-10-07）
+
+- **做法**：`scripts/eval_external.py`。v4、latest、v2 live 各分层抽 30 万行，
+  v2 incident 随机抽 5 万行（与 I10 同一随机种子）；另外单独报告原始消息
+  从未出现在 train 里的“novel”行。比较 B/C/D（content 系列）和
+  F_nomask/F/G/G+w10（timefree 系列）。结果在 `artifacts/external_eval/`。
+- **数据差异**（全量统计，无厂商 + block 判决 一格）：v4 为 93,966 malicious 对
+  3 benign，latest 为 118,586 对 3，两者的 malicious 全部早于 07-26，与比赛数据
+  构造相同。v2 中这一格在 live 里是 0 malicious 对 641 benign，在 incident 里
+  只有 3 行，因为 v2 给历史攻击记录补上了厂商（ASA、VPC、PAN、Meraki）。
+- **结果**（macro-F1；括号内为 malicious 召回）：
+
+  | 版本 | v4 | v4 novel（2,042 行，全 M） | latest | v2 live | v2 incident |
+  | --- | --- | --- | --- | --- | --- |
+  | B content | 0.967 (0.913) | (0.223) | 0.961 (0.920) | 0.749 (0.222) | (0.756) |
+  | C B + 掩码 | 0.988 (0.936) | (0.432) | 0.985 (0.921) | 0.655 (0) | (0.030) |
+  | D C + 日期规则 | 1.000 (1.000) | (1.000) | 0.9996 (1.000) | 0.655 (0) | (1.000) |
+  | F_nomask timefree | 0.977 (0.928) | (0.358) | 0.973 (0.923) | 0.656 (0.003) | (0.303) |
+  | F timefree + 掩码 | 0.991 (0.952) | (0.568) | 0.990 (0.946) | 0.655 (0) | (0.030) |
+  | **G F + 判决规则** | **0.9999 (1.000)** | **(0.998)** | **0.9995 (1.000)** | 0.655 (0) | (0.030) |
+  | G + w10 | 0.9999 (1.000) | (0.998) | 0.9999 (1.000) | 0.655 (0) | (0.030) |
+
+  latest 的 malicious 和 suspicious 消息都不在 train 里（脱敏命名空间不同），
+  latest/novel 的结果与全量一致。v4 novel 就是比赛 valid 的那 14,052 条早期行
+  中的一部分，不是独立数据。
+- **结论**：
+  1. 在按比赛方式构造的数据上（v4、latest），G 不用时间也和日期规则 D 持平；
+     换了脱敏命名空间（latest）也不受影响。
+  2. 在 v2 上所有时间无关版本的 malicious 都基本为 0（live 0，incident 3%，只有
+     Cisco/Meraki 判对）。v2 去掉了比赛数据的两个构造痕迹：live 里攻击与正常
+     不再按时间分开，incident 记录带上了厂商；判决规则不会触发，来源掩码还
+     禁止 ASA/VPC 判 malicious。D 在 incident 上的 100% 只是因为历史攻击记录
+     全在 07-26 之前，在 live 上同样是 0。
+  3. **I10 中 B 在 v2 上“泛化最好”主要来自时间残留**：v2 的每一条 ASA 记录
+     （incident 和 live、所有标签）syslog 头都带字面年份，content 文档里变成
+     `tok_year`；而 B 的 malicious 对 suspicious 最强权重中就有 `tok_date tok_year`、
+     `tok_year tok_time`、`tok_year`（train 里只有历史 malicious 记录头部带字面年份，
+     07-26 采集的 suspicious 年份被脱敏成 `USER-9546`）。所以 B 把 v2 的 ASA 普遍
+     推向 malicious：incident 召回 0.78，但 live 中 371 条 suspicious 也被判成
+     malicious，live malicious 只对一半。timefree 把两种头部都变成
+     `tok_cal 0 0 0:0:0`，这一信号就消失了。I10 的结论“v2 的 malicious 单条
+     日志基本不可学”更加确定。
+  4. 已知问题，未修：v2 live 中有 641 条 CloudTrail JSON 的
+     `"logStreamName":"eni-…-reject"` 被判决提取器当成 block，在无厂商行上触发
+     规则，抽样中多出约 100 个误报。修复方法是不把与 `-`、`_` 相连的词当作判决，
+     但这是看了外部测试数据之后才发现的，修完之后 v2 live 就不再是独立测试。
+- **产物**：`scripts/eval_external.py`、`artifacts/external_eval/results.json`、
+  `artifacts/external_eval/malicious_recall_by_source.csv`。

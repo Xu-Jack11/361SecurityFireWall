@@ -17,7 +17,10 @@ _TOKEN_CLEAN_RE = re.compile(r"[^0-9A-Za-z_.:/=@+-]+")
 # suspicious rows are all stamped 2024-07-26 ~11:00 UTC while malicious rows
 # span 2022-06..2024-07-18, and the test set's hosts, users and sanitizer IDs
 # barely overlap with training, so time and identifier tokens do not transfer.
-FEATURE_SETS = ("full", "content")
+# "timefree" is "content" with a stricter message normalizer that leaves no
+# digit and no calendar word in the document, plus a firewall-action token
+# (see _build_timefree_documents).
+FEATURE_SETS = ("full", "content", "timefree")
 
 CONTENT_CATEGORICAL_COLUMNS = ("pipeline", "product_name", "vendor_name")
 IDENTIFIER_COLUMNS = ("src_ip", "dst_ip", "src_host", "dst_host", "username")
@@ -43,6 +46,38 @@ _MESSAGE_NORMALIZERS = (
     (re.compile(r"\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{8,}\b", re.IGNORECASE), "tok_hex"),
     (re.compile(r"\b\d{5,}\b"), "tok_num"),
 )
+
+# The "content" normalizers above leave time fragments behind: the sanitizer
+# only rewrote parts of some epochs, so "167CRED-25166941" (2022) and
+# "17CRED-CRED-28950023" (2024) still differ, and Palo Alto dates survive as
+# "tok_user/05/08". Rather than chase every format, the timefree view maps
+# every sanitizer token and every digit run to "0" and masks calendar words,
+# so a document cannot change when any number or date in the message does.
+_SANITIZER = "USER|ORG|CRED|HOST"
+_TIMEFREE_NORMALIZERS = (
+    # Dangling prefix glued to another token, e.g. the first "CRED-" in "CRED-CRED-28950023".
+    (re.compile(rf"(?:{_SANITIZER})-(?=(?:{_SANITIZER})-\d)"), ""),
+    (re.compile(rf"(?:{_SANITIZER})(?:-\d+)+"), "0"),
+    (re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "tok_uuid"),
+    (re.compile(r"\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{8,}\b", re.IGNORECASE), "tok_hex"),
+    (re.compile(rf"\b(?:{_MONTHS}|{_WEEKDAYS}|AM|PM|UTC|GMT|[ECMP][SD]T)\b", re.IGNORECASE), "tok_cal"),
+    (re.compile(r"\d+"), "0"),
+)
+
+# Vendor-agnostic verdict words of firewall / flow records: ASA "Deny",
+# Palo Alto "TRAFFIC,drop", VPC "REJECT", Meraki "decision=blocked", CEF "act=DENY".
+# A word that is the value of some other key is not a verdict: every benign
+# vendor-less "block" in train.parquet is an HTTP header ("X-XSS-Protection:
+# 1; mode=block", "X-Frame-Options: DENY"), often inside escaped JSON. A key
+# the sanitizer replaced ("HOST-0121=BLOCKED") is unknown, so it still counts.
+_VERDICT_RE = re.compile(
+    r"\b(?:(?P<block>deny|denied|drop|dropped|reject|rejected|block|blocked)"
+    r"|(?P<allow>accept|accepted|allow|allowed|permit|permitted))\b",
+    re.IGNORECASE,
+)
+_VALUE_OF_KEY_RE = re.compile(r"""([A-Za-z_][\w-]*)[\\"']*\s*[=:]\s*[\\"']*$""")
+_SANITIZED_KEY_RE = re.compile(rf"(?:{_SANITIZER})(?:-\d+)+")
+_VERDICT_KEYS = frozenset({"action", "act", "decision", "disposition", "verdict"})
 
 
 def port_bucket(value: Any) -> str:
@@ -110,11 +145,48 @@ def normalize_message(messages: pd.Series) -> pd.Series:
     return pd.Series(normalized.to_numpy()[codes], index=messages.index, dtype="object")
 
 
+def normalize_message_timefree(messages: pd.Series) -> pd.Series:
+    """Map sanitizer tokens and digit runs to "0" and mask calendar words."""
+
+    codes, uniques = pd.factorize(messages.fillna("").astype(str))
+    normalized = pd.Series(uniques, dtype="object")
+    for pattern, replacement in _TIMEFREE_NORMALIZERS:
+        normalized = normalized.str.replace(pattern, replacement, regex=True)
+    normalized = normalized.str.strip()
+    return pd.Series(normalized.to_numpy()[codes], index=messages.index, dtype="object")
+
+
+def firewall_action(messages: pd.Series) -> pd.Series:
+    """Classify each message as a "block", "allow" or "none" verdict; block wins."""
+
+    codes, uniques = pd.factorize(messages.fillna("").astype(str))
+    actions = [_message_verdict(text) for text in uniques]
+    return pd.Series(pd.Series(actions, dtype="object").to_numpy()[codes], index=messages.index, dtype="object")
+
+
+def _message_verdict(text: str) -> str:
+    verdict = "none"
+    for match in _VERDICT_RE.finditer(text):
+        key = _VALUE_OF_KEY_RE.search(text[max(0, match.start() - 40) : match.start()])
+        if (
+            key
+            and key.group(1).lower() not in _VERDICT_KEYS
+            and not _SANITIZED_KEY_RE.fullmatch(key.group(1))
+        ):
+            continue
+        if match.group("block"):
+            return "block"
+        verdict = "allow"
+    return verdict
+
+
 def build_log_documents(df: pd.DataFrame, feature_set: str = "full") -> pd.Series:
     """Build one model document per event from structured fields and message text."""
 
     if feature_set == "content":
         return _build_content_documents(df)
+    if feature_set == "timefree":
+        return _build_timefree_documents(df)
     if feature_set != "full":
         raise ValueError(f"Unknown feature_set {feature_set!r}; expected one of {FEATURE_SETS}")
 
@@ -157,6 +229,42 @@ def _build_content_documents(df: pd.DataFrame) -> pd.Series:
     docs = docs.str.cat("src_port_bucket=" + src_ports, sep=" ")
 
     messages = normalize_message(_column_or_empty(df, "message_sanitized"))
+    docs = docs.str.cat("message_empty=" + (messages == "").map({True: "yes", False: "no"}), sep=" ")
+    docs = docs.str.cat(messages, sep=" ")
+
+    return docs.str.replace(r"\s+", " ", regex=True).str.strip()
+
+
+def _build_timefree_documents(df: pd.DataFrame) -> pd.Series:
+    """Content document with no digit or calendar word, plus the firewall verdict.
+
+    In train.parquet every vendor-less record with a block verdict is
+    malicious (ASA Deny, Meraki l7 blocked, WAF DENY) while the same records
+    with a vendor attached are suspicious; ``fw_action_vendor`` exposes that
+    combination so the model can carry it to block formats it never saw.
+    """
+
+    docs = pd.Series("", index=df.index, dtype="object")
+
+    for column in CONTENT_CATEGORICAL_COLUMNS:
+        values = _clean_token_series(_column_or_empty(df, column))
+        docs = docs.str.cat(column + "=" + values, sep=" ")
+
+    for column in IDENTIFIER_COLUMNS:
+        kinds = _column_or_empty(df, column).map(value_kind)
+        docs = docs.str.cat(column + "_kind=" + kinds, sep=" ")
+
+    src_ports = _column_or_empty(df, "src_port").map(port_bucket)
+    docs = docs.str.cat("src_port_bucket=" + src_ports, sep=" ")
+
+    raw_messages = _column_or_empty(df, "message_sanitized")
+    actions = firewall_action(raw_messages)
+    vendor = _column_or_empty(df, "vendor_name").fillna("").astype(str).str.strip()
+    vendor_state = (vendor == "").map({True: "missing", False: "present"})
+    docs = docs.str.cat("fw_action=" + actions, sep=" ")
+    docs = docs.str.cat("fw_action_vendor=" + actions + "_" + vendor_state, sep=" ")
+
+    messages = normalize_message_timefree(raw_messages)
     docs = docs.str.cat("message_empty=" + (messages == "").map({True: "yes", False: "no"}), sep=" ")
     docs = docs.str.cat(messages, sep=" ")
 

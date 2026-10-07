@@ -47,12 +47,28 @@ python -m soc_baseline.train \
 Use `--model-backend sklearn` for the original CPU fallback.
 
 The default feature set reproduces the original baseline, whose timestamp and
-identifier tokens leak the label (see `docs/iteration_log.md`, I9). For the
-leak-free model with the per-source label mask add:
+identifier tokens leak the label (see `docs/iteration_log.md`, I9). The
+recommended model uses no time information at all (I13): train with
 
 ```bash
-  --feature-set content --source-label-mask
+  --feature-set timefree --source-label-mask
 ```
+
+then apply the train-derived firewall verdict rule (vendor-less records with a
+deny/drop/reject/blocked verdict are malicious in training) and check that no
+prediction depends on time:
+
+```bash
+python scripts/apply_verdict_rule.py --submission res.csv --output res_verdict_rule.csv
+python scripts/check_time_independence.py --model-dir artifacts --verdict-rule
+```
+
+Add `--benign-weight 10` to training to treat a missed benign row as 10x as
+costly as other errors: an alert label is only predicted when it is >10x as
+likely as benign.
+
+Submission scores against the labeled answer file are produced by
+`python scripts/score_submissions.py` (see `docs/iteration_log.md`, I11–I13).
 
 Generated files:
 

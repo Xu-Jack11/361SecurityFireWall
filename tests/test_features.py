@@ -2,7 +2,13 @@ import unittest
 
 import pandas as pd
 
-from soc_baseline.features import build_log_documents, normalize_message, port_bucket
+from soc_baseline.features import (
+    build_log_documents,
+    firewall_action,
+    normalize_message,
+    normalize_message_timefree,
+    port_bucket,
+)
 
 
 class FeatureTests(unittest.TestCase):
@@ -106,6 +112,70 @@ class FeatureTests(unittest.TestCase):
         self.assertEqual(normalized[1], "tok_date tok_time sshd[tok_num]: disconnect from tok_ip Monitor")
         self.assertEqual(normalized[2], "eni-tok_hex tok_epoch tok_date tok_weekday")
         self.assertEqual(normalized[3], "")
+
+    def test_timefree_normalizer_leaves_no_digit_or_calendar_word(self):
+        normalized = normalize_message_timefree(
+            pd.Series(
+                [
+                    "<14>May  8 00:04:50 USER-0010-0051 1,USER-9564/05/08 00:04:49,TRAFFIC,drop,udp",
+                    "2 100000000001 eni-0ec1cf3543aa16eec 10.100.6.190 167CRED-25166941 REJECT OK",
+                    "2 100000013063 ORG-1504 100.64.0.230 17CRED-CRED-28950023 REJECT OK",
+                    "Sunday 11:28 PM EDT",
+                ]
+            )
+        ).tolist()
+
+        self.assertEqual(normalized[0], "<0>tok_cal  0 0:0:0 0 0,0/0/0 0:0:0,TRAFFIC,drop,udp")
+        self.assertEqual(normalized[1], "0 0 eni-tok_hex 0.0.0.0 0 REJECT OK")
+        self.assertEqual(normalized[2], "0 0 0 0.0.0.0 0 REJECT OK")
+        self.assertEqual(normalized[3], "tok_cal 0:0 tok_cal tok_cal")
+
+    def test_timefree_documents_do_not_depend_on_any_date(self):
+        frame_2022 = self._asa_frame(1_662_097_857.0)
+        frame_2022.loc[0, "message_sanitized"] = (
+            "<164>Sep 02 2022 05:50:57: USER-0010-0324 Deny tcp src outside:100.64.134.154/58534 "
+            "dst DMZ:10.76.132.170/1962 by ORG-1738-group"
+        )
+        frame_2024 = self._asa_frame(1_721_993_000.0)
+        frame_2024.loc[0, "message_sanitized"] = (
+            "<180>Jul 28 USER-9564 13:36:43: USER-0010-0324 Deny tcp src outside:100.64.82.105/49012 "
+            "dst DMZ:172.17.226.234/CRED-24615 by ORG-1738-group"
+        )
+
+        doc_2022 = build_log_documents(frame_2022, "timefree").iloc[0]
+        doc_2024 = build_log_documents(frame_2024, "timefree").iloc[0]
+
+        self.assertEqual(doc_2022, doc_2024)
+        self.assertNotRegex(doc_2022.split("message_empty=no ", 1)[1], r"[1-9]")
+
+    def test_firewall_action_prefers_block_and_ignores_substrings(self):
+        actions = firewall_action(
+            pd.Series(
+                [
+                    "TRAFFIC,drop,udp",
+                    "decision=blocked accepted",
+                    "flow ACCEPT OK",
+                    "AccessDenied by policy",
+                    '{"X-Xss-Protection":["1; mode=block"],"status":"allowed"}',
+                    '{\\"X-Frame-Options\\":\\"DENY\\"}',
+                    "CEF:0|WAF|act=DENY msg=x",
+                    "fqdn=HOST-500127 ::: HOST-0121=BLOCKED",
+                    None,
+                ]
+            )
+        ).tolist()
+
+        self.assertEqual(actions, ["block", "block", "allow", "none", "none", "none", "block", "block", "none"])
+
+    def test_timefree_documents_tag_action_with_vendor_presence(self):
+        frame = self._asa_frame(1.0)
+        vendorless = build_log_documents(frame, "timefree").iloc[0]
+        frame.loc[0, "vendor_name"] = "Cisco"
+        with_vendor = build_log_documents(frame, "timefree").iloc[0]
+
+        self.assertIn("fw_action=block", vendorless)
+        self.assertIn("fw_action_vendor=block_missing", vendorless)
+        self.assertIn("fw_action_vendor=block_present", with_vendor)
 
 
 if __name__ == "__main__":

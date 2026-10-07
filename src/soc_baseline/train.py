@@ -26,7 +26,8 @@ from .modeling import (
     write_label_distribution,
     write_metrics,
 )
-from .source_mask import fit_source_label_mask, predict_with_source_mask, source_keys
+from .decision import weighted_argmax
+from .source_mask import allowed_label_matrix, fit_source_label_mask, source_keys
 from .submission import validate_submission_frame
 
 
@@ -47,6 +48,7 @@ class BaselineConfig:
     feature_set: str = "full"
     source_label_mask: bool = False
     source_mask_min_rows: int = 100
+    benign_weight: float = 1.0
     model_backend: str = "auto"
     device: str = "auto"
     torch_epochs: int = 3
@@ -92,7 +94,13 @@ def run_baseline(config: BaselineConfig) -> dict[str, Any]:
         else None
     )
     holdout_predictions = pd.Series(
-        _predict(evaluation_model, holdout_docs, sources.loc[holdout_docs.index], evaluation_mask),
+        _predict(
+            evaluation_model,
+            holdout_docs,
+            sources.loc[holdout_docs.index],
+            evaluation_mask,
+            config.benign_weight,
+        ),
         index=holdout_labels.index,
     )
     probabilities = evaluation_model.predict_proba(holdout_docs) if hasattr(evaluation_model, "predict_proba") else None
@@ -116,6 +124,7 @@ def run_baseline(config: BaselineConfig) -> dict[str, Any]:
             "min_df": int(config.min_df),
             "feature_set": config.feature_set,
             "source_label_mask": bool(config.source_label_mask),
+            "benign_weight": float(config.benign_weight),
             "model_backend": model_info["model_backend"],
             "device": model_info["device"],
         }
@@ -151,6 +160,7 @@ def run_baseline(config: BaselineConfig) -> dict[str, Any]:
         config.max_test_rows,
         feature_set=config.feature_set,
         source_mask=final_mask,
+        benign_weight=config.benign_weight,
     )
     expected_ids = read_parquet_frame(config.test_path, columns=[ID_COLUMN])[ID_COLUMN]
     if config.max_test_rows is not None:
@@ -172,6 +182,7 @@ def predict_parquet_to_submission(
     max_rows: int | None,
     feature_set: str = "full",
     source_mask: dict[str, list[str]] | None = None,
+    benign_weight: float = 1.0,
 ) -> int:
     """Predict a parquet test file in batches and stream a submission CSV.
 
@@ -198,7 +209,7 @@ def predict_parquet_to_submission(
         if frame.empty:
             continue
         documents = build_log_documents(frame, feature_set)
-        predictions = _predict(model, documents, source_keys(frame), source_mask)
+        predictions = _predict(model, documents, source_keys(frame), source_mask, benign_weight)
         output_frame = pd.DataFrame({ID_COLUMN: frame[ID_COLUMN].astype(str), "pred_label": predictions})
         output_frame.to_csv(output, index=False, mode="w" if first else "a", header=first)
         written += len(output_frame)
@@ -211,10 +222,13 @@ def _predict(
     documents: pd.Series,
     sources: pd.Series,
     source_mask: dict[str, list[str]] | None,
+    benign_weight: float = 1.0,
 ) -> Any:
-    if source_mask is None:
+    if source_mask is None and benign_weight == 1.0:
         return model.predict(documents)
-    return predict_with_source_mask(model, documents, sources, source_mask, _model_classes(model))
+    classes = _model_classes(model)
+    allowed = allowed_label_matrix(sources, source_mask, classes) if source_mask is not None else None
+    return weighted_argmax(model.predict_proba(documents), classes, allowed, {"benign": benign_weight})
 
 
 def _split_train_holdout(
@@ -271,6 +285,12 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=100,
         help="Training rows a source needs before its label set is enforced.",
+    )
+    parser.add_argument(
+        "--benign-weight",
+        type=float,
+        default=1.0,
+        help="Relative cost of missing a benign row; >1 only alerts when p(alert) > weight * p(benign).",
     )
     parser.add_argument(
         "--model-backend",
