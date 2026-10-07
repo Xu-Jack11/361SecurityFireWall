@@ -6,9 +6,12 @@ records with a firewall block verdict are malicious, checks the cell's support
 and purity, and forces that label on the matching test rows. See
 src/soc_baseline/verdict_rule.py for what the rule does and does not mean.
 
+`--save-rule` writes the fitted rule to JSON; `--rule` applies such a file
+instead of refitting, so the training data is not needed (released weights).
+
 Usage:
   python scripts/apply_verdict_rule.py --submission artifacts/timefree/res_timefree.csv \
-      --output artifacts/timefree/res_verdict_rule.csv
+      --output artifacts/timefree/res_verdict_rule.csv [--save-rule verdict_rule.json]
 """
 
 from __future__ import annotations
@@ -35,10 +38,18 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--min-rows", type=int, default=1000)
     parser.add_argument("--min-purity", type=float, default=0.999)
+    parser.add_argument("--rule", type=Path, default=None, help="Apply this saved rule instead of fitting one.")
+    parser.add_argument("--save-rule", type=Path, default=None, help="Write the fitted rule to this JSON file.")
     args = parser.parse_args()
 
-    train = read_parquet_frame(args.train_path, columns=[*RULE_COLUMNS, LABEL_COLUMN])
-    rule = fit_verdict_rule(train, train[LABEL_COLUMN], args.min_rows, args.min_purity)
+    if args.rule is not None:
+        rule = json.loads(args.rule.read_text(encoding="utf-8"))
+    else:
+        train = read_parquet_frame(args.train_path, columns=[*RULE_COLUMNS, LABEL_COLUMN])
+        rule = fit_verdict_rule(train, train[LABEL_COLUMN], args.min_rows, args.min_purity)
+        if args.save_rule is not None:
+            args.save_rule.parent.mkdir(parents=True, exist_ok=True)
+            args.save_rule.write_text(json.dumps(rule, indent=2), encoding="utf-8")
 
     test = read_parquet_frame(args.test_path, columns=[ID_COLUMN, *RULE_COLUMNS])
     submission = pd.read_csv(args.submission, dtype={ID_COLUMN: str})

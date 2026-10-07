@@ -1,5 +1,6 @@
 data/
 artifacts/
+weights/
 res.csv
 *.joblib
 *.pyc

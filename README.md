@@ -67,6 +67,23 @@ Add `--benign-weight 10` to training to treat a missed benign row as 10x as
 costly as other errors: an alert label is only predicted when it is >10x as
 likely as benign.
 
+### Released weights
+
+The time-free models are published as a GitHub release
+([`weights-timefree-20261007`](https://github.com/Xu-Jack11/361SecurityFireWall/releases/tag/weights-timefree-20261007)).
+Check out that tag, unzip the asset into the repository root (it creates
+`weights/`) and predict without training data:
+
+```bash
+python scripts/predict.py --model-dir weights/timefree \
+  --test-path data/valid_input.parquet --output res.csv \
+  --verdict-rule weights/verdict_rule.json
+```
+
+`model.joblib` is a pickle; verify `weights/SHA256SUMS` and only load weights
+you trust. `scripts/predict.py` works with any `--artifacts-dir` produced by
+training; `scripts/apply_verdict_rule.py --save-rule` writes the rule JSON.
+
 Submission scores against the labeled answer file are produced by
 `python scripts/score_submissions.py` (see `docs/iteration_log.md`, I11–I13).
 

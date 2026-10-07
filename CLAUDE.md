@@ -54,6 +54,11 @@ comparison. The default `--feature-set full` is kept only to reproduce the
 original baseline — its time tokens leak the label and drive ~44% malicious
 predictions on the test set.
 
+Predict from saved weights without retraining (an artifacts dir or the
+released `weights/timefree`): `python scripts/predict.py --model-dir DIR
+--output res.csv [--verdict-rule weights/verdict_rule.json]`; it reads the
+feature set and benign weight from `DIR/metrics.json`.
+
 Fast smoke run: `python -m soc_baseline.train --max-train-rows 50000 --max-test-rows 200000`
 Force CPU: add `--model-backend sklearn`.
 
