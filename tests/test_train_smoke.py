@@ -116,7 +116,6 @@ class TrainSmokeTests(unittest.TestCase):
                 BaselineConfig(
                     train_path=tmp_path / "train.parquet",
                     test_path=tmp_path / "valid_input.parquet",
-                    output_path=tmp_path / "res.csv",
                     artifacts_dir=artifacts_dir,
                     max_train_rows=None,
                     test_size=0.25,
@@ -132,7 +131,10 @@ class TrainSmokeTests(unittest.TestCase):
                 )
             )
 
-            submission = pd.read_csv(tmp_path / "res.csv").set_index("event_id")["pred_label"]
+            # Without output_path the predictions stay in the artifacts dir, not res.csv.
+            self.assertEqual(result["output_path"], str(artifacts_dir / "predictions.csv"))
+            self.assertFalse((tmp_path / "res.csv").exists())
+            submission = pd.read_csv(artifacts_dir / "predictions.csv").set_index("event_id")["pred_label"]
             self.assertEqual(submission["te0"], "benign")
             self.assertEqual(result["feature_set"], "content")
             self.assertTrue(result["source_label_mask"])

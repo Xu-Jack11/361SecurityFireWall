@@ -7,13 +7,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A reproducible baseline for a SOC (Security Operations Center) security-event
 classification challenge. It trains a class-balanced TF-IDF linear model over
 security log text plus structured field tokens, evaluates a holdout split,
-writes diagnostics, and streams the required `res.csv` submission
+writes diagnostics, and streams predictions in the submission format
 (`event_id,pred_label`). Labels are 3-class: `benign`, `suspicious`,
 `malicious` (see `LABELS` in `src/soc_baseline/constants.py`).
 
-The `data/` directory (git-ignored) is expected to contain the parquet inputs:
-`data/train.parquet` (labeled, with a `label_binary` column) and
-`data/valid_input.parquet` (unlabeled test input).
+The `data/` directory (git-ignored) contains the parquet inputs:
+`data/train.parquet` (labeled, with a `label_binary` column),
+`data/valid_input.parquet` and `data/valid_answer_private.parquet`.
+
+**`valid_input` is the validation set, not the test set.** Its labels are in
+`valid_answer_private.parquet`. Use them only to score predictions
+(`scripts/score_submissions.py`, `soc_hybrid.evaluate`), never for training or
+tuning. The competition test set is not in `data/`. `res.csv` is the name of
+the competition submission, so write it only when predicting that test set
+(`--test-path <test parquet> --output res.csv`). Don't produce a new `res.csv`
+from valid. Prediction runs on valid write to their artifacts dir
+(`predictions.csv` / `valid_pred.csv`). Older files named `res*.csv` (the root
+`res.csv` and the files under `artifacts/`) are historical predictions on valid,
+kept because the scoring scripts and the iteration log reference them. Iteration log
+entries before I11 call valid the "测试集".
+
+Scoring (corrected 2026-10-08): the competition scores threat detection and the 3-class
+split together. A threat (suspicious or malicious) predicted as benign is penalized most;
+suspicious and malicious predicted as each other earn partial credit. The exact weights are
+not known, so `soc_hybrid` costs every result with `decision.cost_matrix(m)` at m = 2, 5, 10.
+Benign-first tuning (`--benign-weight`, I12, and I16's `final4`) targets the opposite error.
 
 ## Environment setup
 
@@ -35,13 +53,15 @@ Run the full pipeline (train → evaluate → refit → predict → write artifa
 ```bash
 python -m soc_baseline.train \
   --train-path data/train.parquet --test-path data/valid_input.parquet \
-  --output res.csv --artifacts-dir artifacts \
+  --artifacts-dir artifacts \
   --max-train-rows 300000 --model-backend gpu --device cuda
 ```
 
+Without `--output`, predictions go to `<artifacts-dir>/predictions.csv`.
+
 Time-free variant (I13 in `docs/iteration_log.md`, the recommended one): add
 `--feature-set timefree --source-label-mask`, then run
-`python scripts/apply_verdict_rule.py --submission <res.csv> --output <out.csv>`
+`python scripts/apply_verdict_rule.py --submission <pred.csv> --output <out.csv>`
 (add `--benign-weight 10` to training when missed benign rows are the costlier
 error, I12). `scripts/check_time_independence.py --verdict-rule` verifies that
 rewriting every timestamp, digit and calendar word changes no prediction, and
@@ -52,12 +72,40 @@ no malicious recall on v2, whose labels no single record can recover).
 epochs, and `scripts/apply_date_rule.py` is time-based; both are kept for
 comparison. The default `--feature-set full` is kept only to reproduce the
 original baseline — its time tokens leak the label and drive ~44% malicious
-predictions on the test set.
+predictions on valid.
 
 Predict from saved weights without retraining (an artifacts dir or the
 released `weights/timefree`): `python scripts/predict.py --model-dir DIR
---output res.csv [--verdict-rule weights/verdict_rule.json]`; it reads the
+--output OUT.csv [--test-path P] [--verdict-rule weights/verdict_rule.json]`;
+`--output` is required, `--test-path` defaults to valid, and it reads the
 feature set and benign weight from `DIR/metrics.json`.
+
+LLM routing (I15): `scripts/llm_reasoning_probe.py` runs a local LLM (vLLM,
+Qwen3.5-4B from ModelScope at `/root/.cache/modelscope/hub/models/Qwen/Qwen3.5-4B`)
+zero-shot over one event at a time. `sample`/`run`/`score` evaluate it on a
+probe sample; `route --no-thinking` keeps G and sends only rows of sources with
+< 100 train rows to the LLM, writing `artifacts/llm_probe/Qwen3.5-4B-nothink/res_route.csv`
+(99 errors on valid vs 864 for G). Use `.venv/bin/python`; the T4 memory
+settings in `run()` are needed to avoid OOM, and thinking mode costs ~17× the
+tokens for no accuracy gain.
+
+Classifier + LLM hybrid (I16, I17): `src/soc_hybrid/` is a separate package built from
+train only (it uses no `soc_baseline` model, rule or prediction). Stages:
+`audit` → `holdout` (ud5/cl5/LOSO/LOCO) → `novelty` → `llm_holdout` →
+`cost_select` (corrected rule, I17; `route_select` / `classifier_select` did the
+benign-first selection of I16) → `pipeline` (predicts valid, writes
+`artifacts/hybrid/runs/<name>/valid_pred.csv`; runs made before this rename
+have `res.csv`) → `evaluate` / `ablation` (the only steps that read valid
+labels). The current config is the `cost2` command in the iteration log (I18;
+`cost1` in I17 is the same with a 2,000-document LLM budget): `--miss-weight`
+switches the classifier to the minimum-cost decision, `--fusion gate_km|raise|mix_km`
+to the corrected-rule fusions, and `--budget 0` sends every triggered document to the LLM.
+`python -m soc_hybrid.external` (I19) runs that config unchanged on 10,000 random rows of each
+`data/external` group and scores them there. LLM replies are
+cached in `artifacts/hybrid/llm/*.jsonl`.
+vLLM must be started from a script or module, not stdin (it spawns workers), and
+`soc_hybrid.llm` pins `VLLM_PORT` above the ephemeral range because proxy
+connections can hold vLLM's default port.
 
 Fast smoke run: `python -m soc_baseline.train --max-train-rows 50000 --max-test-rows 200000`
 Force CPU: add `--model-backend sklearn`.
@@ -123,20 +171,20 @@ The package lives in `src/soc_baseline/` (src-layout; installed as
 - **`verdict_rule.py`** — post-prediction rule used by
   `scripts/apply_verdict_rule.py`: learns from the training labels that the
   vendor-less + block-verdict cell is malicious (support and purity checked,
-  raises otherwise) and forces that label on matching test rows. It is the
+  raises otherwise) and forces that label on matching predicted rows. It is the
   time-free replacement for the date rule and, like it, exploits how the
   dataset was built rather than a transferable security signal.
 - **`submission.py`** — `validate_submission_frame` enforces the exact output
   contract (columns, no duplicate/missing/extra `event_id`, only allowed
-  labels, row-count match). The pipeline validates its own `res.csv` before
-  finishing.
+  labels, row-count match). The pipeline validates its own prediction CSV
+  before finishing.
 - **`train.py`** — orchestrator + CLI. `BaselineConfig` holds all knobs;
   `_make_configured_model` resolves the `--model-backend`
   (`auto`/`gpu`/`torch`/`cpu`/`sklearn`) into a concrete estimator (`auto`
   falls back to sklearn when CUDA is absent). It trains a holdout model for
-  metrics, then **refits a fresh model on the full sample** for the actual
-  submission, and streams predictions over the test parquet in batches
-  (`predict_parquet_to_submission`) to bound memory on the large input.
+  metrics, then **refits a fresh model on the full sample** for prediction,
+  and streams predictions over the `--test-path` parquet (valid by default) in
+  batches (`predict_parquet_to_submission`) to bound memory on the large input.
 
 ### Backend abstraction — the key invariant
 
