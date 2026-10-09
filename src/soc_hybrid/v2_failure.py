@@ -14,6 +14,8 @@ incident_ids), which the competition data do not carry, and never touches valid:
   system       what the routing triggers saw in the I19 run (artifacts/hybrid/external/*_rows.parquet)
   leads        why identical v2 records carry both labels: the dataset card calls a row malicious only if Precinct
                attached that artifact to an incident as a lead, and Precinct attaches few records of a repeated activity
+  train        why train shows no such conflict: label conflicts in train, and the train label of v2's in-place leads
+               (rows matched on the microsecond ingest timestamp, unique in train)
 
 python -m soc_hybrid.v2_failure [--parts leads,...]  → artifacts/hybrid/v2_failure/summary.json
 (--parts reruns only the named parts and keeps the others' saved results)
@@ -31,7 +33,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, precision_recall_curve, roc_auc_score
 
-from .data import LABELS, OUT, TRAIN_PATH
+from .data import CACHE, LABELS, OUT, TRAIN_PATH
 from .decision import cost_matrix, min_cost
 from .external import COLUMNS, GROUPS, MISS_WEIGHT, RESULT_DIR, load_models
 from .text import classifier_documents, llm_messages
@@ -307,7 +309,33 @@ def leads() -> dict:
     return report
 
 
-PARTS = ("labels", "same_events", "swap", "separable", "system", "leads")
+def train_side() -> dict:
+    """Train has the same label definition, yet no record carries two labels: v1's in-capture leads were never joined
+    back to their live rows, so they kept the rule label (suspicious), and malicious is only the historical export."""
+
+    columns = ["timestamp", "pipeline", "vendor_name", "product_name", "src_ip", "dst_ip", "src_port", "src_host",
+               "dst_host", "username", "message_sanitized", "label_binary"]
+    train = pd.read_parquet(TRAIN_PATH, columns=columns)
+    fields = train[columns[1:-1]].fillna("").astype(str).agg("\x1f".join, axis=1)
+    docs = pd.read_parquet(CACHE / "train_events.parquet", columns=["doc", "label"])
+    both = lambda labels: {"suspicious", "malicious"} <= set(labels)
+    report = {"records_with_two_labels": int((train.groupby(fields)["label_binary"].nunique() > 1).sum()),
+              "messages_with_suspicious_and_malicious": int(train.groupby(train["message_sanitized"].fillna(""))["label_binary"].agg(both).sum()),
+              "classifier_documents_with_suspicious_and_malicious": int(docs.groupby("doc")["label"].agg(both).sum())}
+    stamp = lambda frame: (frame["timestamp"].astype(float) * 1e6).round().astype("int64")
+    train = train.assign(ts=stamp(train))
+    unique = train.groupby("ts").size().pipe(lambda c: c[c == 1].index)
+    live = pd.read_parquet(GROUPS["v2_live"], columns=["timestamp", "label_binary", "product_name"])
+    matched = live.assign(ts=stamp(live)).merge(train.loc[train["ts"].isin(unique), ["ts", "label_binary", "product_name"]],
+                                                on="ts", suffixes=("_v2", "_train"))
+    report["v2_live_rows_matched"] = int(len(matched))
+    report["matched_same_product"] = round(float((matched["product_name_v2"] == matched["product_name_train"]).mean()), 4)
+    report["v2_label_by_train_label"] = {v2: part["label_binary_train"].value_counts().to_dict()
+                                         for v2, part in matched.groupby("label_binary_v2")}
+    return report
+
+
+PARTS = ("labels", "same_events", "swap", "separable", "system", "leads", "train")
 
 
 def main() -> None:
@@ -364,6 +392,10 @@ def main() -> None:
     if "leads" in parts:
         summary["leads"] = leads()
         print("\n== leads:", json.dumps(summary["leads"], indent=1, ensure_ascii=False))
+
+    if "train" in parts:
+        summary["train"] = train_side()
+        print("\n== train:", json.dumps(summary["train"], indent=1, ensure_ascii=False))
     path.write_text(json.dumps(summary, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
 
 

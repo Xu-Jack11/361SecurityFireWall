@@ -785,4 +785,9 @@ max_features=120k、min_df=3、torch GPU 后端（T4）。
 - **结论**：同内容不同标签不是导出错误，而是标签定义的结果：“是不是被挂为事件的 lead”取决于 Precinct 的挑选（大多只挂
   一条，多的挂到约 100 条为止），这个选择不由记录内容决定。所以 v2 中 suspicious 和 malicious 在同一活动内部的区分，
   任何模型都做不到；若要可学，可以把“产生过 lead 的活动”整体视为 malicious，但那是另一种任务定义。
-- **产物**：`src/soc_hybrid/v2_failure.py`（新增 `leads` 部分和 `--parts` 选项）、`artifacts/hybrid/v2_failure/summary.json`。
+- **train 为什么没有这个问题**（`--parts train`）：train 里没有一条记录、一段报文或一个分类器文档同时带 suspicious 和 malicious。
+  v2 之前的版本（train 的 v4 快照属于这一代）没有把采集期内的 lead 标回实时记录（数据卡：那时“benign 和带标签的攻击在时间上
+  从不重叠”）。按微秒级入库时间戳把 v2 live 与 train 对上 136,062 行（产品 100% 一致）：v2 的 1,995 条 malicious 在 train 里
+  全是 suspicious，9,828 条 suspicious 和 124,239 条 benign 标签不变。train 的 malicious 只来自另行导出的历史事件 lead，时间和
+  格式都与实时记录分开，所以标签内部一致，也因此能靠时间和厂商字段区分。
+- **产物**：`src/soc_hybrid/v2_failure.py`（新增 `leads`、`train` 两部分和 `--parts` 选项）、`artifacts/hybrid/v2_failure/summary.json`。
