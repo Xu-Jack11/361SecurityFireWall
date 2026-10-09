@@ -34,8 +34,10 @@ from .submission import validate_submission_frame
 @dataclass(frozen=True)
 class BaselineConfig:
     train_path: Path = Path("data/train.parquet")
+    # valid_input is the labeled validation set, not the competition test set.
     test_path: Path = Path("data/valid_input.parquet")
-    output_path: Path = Path("res.csv")
+    # None writes <artifacts_dir>/predictions.csv; pass res.csv only for the real test set.
+    output_path: Path | None = None
     artifacts_dir: Path = Path("artifacts")
     max_train_rows: int | None = 300_000
     max_test_rows: int | None = None
@@ -62,6 +64,7 @@ def run_baseline(config: BaselineConfig) -> dict[str, Any]:
 
     artifacts_dir = Path(config.artifacts_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
+    output_path = Path(config.output_path) if config.output_path is not None else artifacts_dir / "predictions.csv"
 
     train_df = read_parquet_frame(config.train_path)
     label_col = detect_label_column(train_df)
@@ -155,7 +158,7 @@ def run_baseline(config: BaselineConfig) -> dict[str, Any]:
     submission_rows = predict_parquet_to_submission(
         final_model,
         config.test_path,
-        config.output_path,
+        output_path,
         config.prediction_chunk_size,
         config.max_test_rows,
         feature_set=config.feature_set,
@@ -165,11 +168,11 @@ def run_baseline(config: BaselineConfig) -> dict[str, Any]:
     expected_ids = read_parquet_frame(config.test_path, columns=[ID_COLUMN])[ID_COLUMN]
     if config.max_test_rows is not None:
         expected_ids = expected_ids.head(config.max_test_rows)
-    submission = pd.read_csv(config.output_path)
+    submission = pd.read_csv(output_path)
     validate_submission_frame(submission, expected_ids, LABELS)
 
     metrics["submission_rows"] = int(submission_rows)
-    metrics["output_path"] = str(config.output_path)
+    metrics["output_path"] = str(output_path)
     write_metrics(metrics, artifacts_dir / "metrics.json")
     return metrics
 
@@ -256,10 +259,23 @@ def _validate_training_labels(labels: pd.Series) -> None:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train SOC threat-detection baseline and write res.csv")
+    parser = argparse.ArgumentParser(
+        description="Train SOC threat-detection baseline and write predictions in the submission format"
+    )
     parser.add_argument("--train-path", type=Path, default=Path("data/train.parquet"))
-    parser.add_argument("--test-path", type=Path, default=Path("data/valid_input.parquet"))
-    parser.add_argument("--output", dest="output_path", type=Path, default=Path("res.csv"))
+    parser.add_argument(
+        "--test-path",
+        type=Path,
+        default=Path("data/valid_input.parquet"),
+        help="Parquet to predict. The default is the labeled validation set, not the competition test set.",
+    )
+    parser.add_argument(
+        "--output",
+        dest="output_path",
+        type=Path,
+        default=None,
+        help="Prediction CSV (default: <artifacts-dir>/predictions.csv). Use res.csv only for the real test set.",
+    )
     parser.add_argument("--artifacts-dir", type=Path, default=Path("artifacts"))
     parser.add_argument("--max-train-rows", type=_optional_int, default=300_000)
     parser.add_argument("--max-test-rows", type=_optional_int, default=None)

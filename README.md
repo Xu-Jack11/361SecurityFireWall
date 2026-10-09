@@ -4,12 +4,15 @@ This repository contains a reproducible baseline for the SOC security event
 classification challenge. The local `data/` directory is expected to contain:
 
 - `data/train.parquet`: labeled training logs with `label_binary`
-- `data/valid_input.parquet`: unlabeled test/validation input
+- `data/valid_input.parquet`: validation input (not the competition test set)
+- `data/valid_answer_private.parquet`: validation labels, used only for scoring
 
 The baseline trains a class-balanced TF-IDF model on log text plus structured
 field tokens, evaluates a holdout split, writes model diagnostics, and
-generates the required `res.csv` submission. When CUDA PyTorch is available,
-the default `auto` backend trains the linear classifier on GPU.
+writes predictions in the submission format (`event_id,pred_label`). Only
+predictions on the competition test set are the `res.csv` submission; runs on
+`valid_input` are scored against the validation answers. When CUDA PyTorch is
+available, the default `auto` backend trains the linear classifier on GPU.
 
 ## Setup
 
@@ -37,12 +40,15 @@ uv sync --extra gpu
 python -m soc_baseline.train \
   --train-path data/train.parquet \
   --test-path data/valid_input.parquet \
-  --output res.csv \
   --artifacts-dir artifacts \
   --max-train-rows 300000 \
   --model-backend gpu \
   --device cuda
 ```
+
+Predictions go to `artifacts/predictions.csv` unless `--output` is given. To
+build the submission, point `--test-path` at the test parquet and pass
+`--output res.csv`.
 
 Use `--model-backend sklearn` for the original CPU fallback.
 
@@ -59,7 +65,7 @@ deny/drop/reject/blocked verdict are malicious in training) and check that no
 prediction depends on time:
 
 ```bash
-python scripts/apply_verdict_rule.py --submission res.csv --output res_verdict_rule.csv
+python scripts/apply_verdict_rule.py --submission artifacts/predictions.csv --output artifacts/pred_verdict_rule.csv
 python scripts/check_time_independence.py --model-dir artifacts --verdict-rule
 ```
 
@@ -76,7 +82,7 @@ Check out that tag, unzip the asset into the repository root (it creates
 
 ```bash
 python scripts/predict.py --model-dir weights/timefree \
-  --test-path data/valid_input.parquet --output res.csv \
+  --test-path data/valid_input.parquet --output artifacts/timefree/valid_pred.csv \
   --verdict-rule weights/verdict_rule.json
 ```
 
@@ -84,12 +90,13 @@ python scripts/predict.py --model-dir weights/timefree \
 you trust. `scripts/predict.py` works with any `--artifacts-dir` produced by
 training; `scripts/apply_verdict_rule.py --save-rule` writes the rule JSON.
 
-Submission scores against the labeled answer file are produced by
+Validation scores against the labeled answer file are produced by
 `python scripts/score_submissions.py` (see `docs/iteration_log.md`, I11–I13).
 
 Generated files:
 
-- `res.csv`: required submission with `event_id,pred_label`
+- `artifacts/predictions.csv`: predictions with `event_id,pred_label`
+  (`res.csv` only when `--output res.csv` is passed for the test set)
 - `artifacts/model.joblib`: trained final model
 - `artifacts/metrics.json`: holdout metrics
 - `artifacts/classification_report.csv`: per-class precision/recall/F1

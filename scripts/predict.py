@@ -1,4 +1,4 @@
-"""Write a submission from saved weights, without retraining.
+"""Write predictions (submission format) from saved weights, without retraining.
 
 A weights directory is what `python -m soc_baseline.train --artifacts-dir DIR`
 leaves behind: model.joblib, metrics.json (feature set, benign weight) and,
@@ -9,9 +9,13 @@ docs/iteration_log.md), so no training data is needed.
 
 model.joblib is a pickle: only load weights from a source you trust.
 
+data/valid_input.parquet (the default --test-path) is the labeled validation
+set, not the competition test set: score its predictions with
+scripts/score_submissions.py and write res.csv only for the real test set.
+
 Usage:
   python scripts/predict.py --model-dir weights/timefree \
-      --test-path data/valid_input.parquet --output res.csv \
+      --output artifacts/timefree/valid_pred.csv \
       --verdict-rule weights/verdict_rule.json
 """
 
@@ -35,7 +39,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--test-path", type=Path, default=Path("data/valid_input.parquet"))
-    parser.add_argument("--output", type=Path, default=Path("res.csv"))
+    parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--verdict-rule", type=Path, default=None, help="Rule JSON from apply_verdict_rule.py --save-rule.")
     parser.add_argument("--chunk-size", type=int, default=200_000)
     args = parser.parse_args()
