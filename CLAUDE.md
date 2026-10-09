@@ -101,7 +101,9 @@ labels). The current config is the `cost2` command in the iteration log (I18;
 switches the classifier to the minimum-cost decision, `--fusion gate_km|raise|mix_km`
 to the corrected-rule fusions, and `--budget 0` sends every triggered document to the LLM.
 `python -m soc_hybrid.external` (I19) runs that config unchanged on 10,000 random rows of each
-`data/external` group and scores them there. LLM replies are
+`data/external` group and scores them there; `python -m soc_hybrid.v2_failure` (I20) explains why v2's malicious rows
+come out suspicious (v2 labels incident links; the competition's malicious rows are the same events exported without
+vendor fields, which is what the classifier keys on). LLM replies are
 cached in `artifacts/hybrid/llm/*.jsonl`.
 vLLM must be started from a script or module, not stdin (it spawns workers), and
 `soc_hybrid.llm` pins `VLLM_PORT` above the ephemeral range because proxy

@@ -670,3 +670,47 @@ max_features=120k、min_df=3、torch GPU 后端（T4）。
   3. v4 和 latest 主要是 train 的事件本身：v4 的新颖行只有 78 行（全是 malicious，都报了告警）；latest 重新脱敏后有 8,175 行的分类器
      文档是新的，结果仍然一行不错。
 - **产物**：`src/soc_hybrid/external.py`、`artifacts/hybrid/external/`（`summary.json`、各组逐行结果）、`llm/external.jsonl`。
+
+## I20 · v2 上 malicious 全判成 suspicious 的原因（2026-10-09）
+
+- **问题**：I19 中四组外部数据都是威胁零漏报、零误报，但 v2_live 的 43 行、v2_incident 的 9,701 行 malicious 都判成了 suspicious。
+- **方法**（`python -m soc_hybrid.v2_failure`，不读 valid）：读外部数据自带、比赛数据没有的打标字段（`lifecycle_stage`、
+  `matched_rules`、`incident_ids`）；把 v4 的 malicious 和 v2 的 incident_signals 按（秒级时间戳, 源端口, 目的端口）配对，
+  在配对事件上交换报文格式和厂商字段，交给最终方案的分类器；在 v2 自己的标签上训练 TF-IDF + 逻辑回归，检验单条记录能否
+  区分 malicious 和 suspicious。
+- **结果**：
+  1. 所有版本的标签都由 Precinct 的关联结果决定：没有规则命中 = benign；命中检测规则（几乎都是 Blocked Action）= suspicious；
+     被关联进事件 = malicious。v2 live 中 malicious 就是 `incident_ids` 非空的记录（7,728 行对 0 行）。
+  2. 差别在导出格式。v4 和 latest 的 malicious 100% 没有厂商字段、没有规则命中记录，suspicious 100% 有厂商；train 同样
+     （111,728 行对 0 行）。v2 的 malicious 带厂商、命中 Blocked Action，格式和 suspicious 相同。
+  3. 同一批事件：v4 的 125,780 行 malicious，时间戳全部出现在 v2 incident_signals 里；配出 20,365 对一一对应的事件
+     （ASA 12,705、Meraki 5,831、PAN 1,507、VPC 281），时间、端口和报文模板相同，v4 去掉了厂商并多换了几处伪名。
+  4. 交换实验（判成 malicious 的比例）：
+
+     | 报文 | 厂商字段 | 全部 | ASA | Meraki | PAN | VPC |
+     | --- | --- | --- | --- | --- | --- | --- |
+     | v4 | 没有（v4 原样） | 99.9% | 100% | 100% | 98.3% | 100% |
+     | v4 | 换成 v2 的 | 28.7% | 0% | 99.9% | 0% | 0% |
+     | v2 | 去掉 | 100% | 100% | 100% | 100% | 100% |
+     | v2 | 有（v2 原样） | 28.7% | 0% | 99.9% | 0% | 0% |
+
+     报文格式几乎不起作用，厂商字段决定类型。Meraki 的 flows 记录在 train 里只以无厂商的 malicious 出现（32,596 行），模板本身
+     带着标签，所以 I19 中 v2_incident 判对的 299 行里有 286 行是 Meraki。全量上，incident_signals 原样 96.9% 判 suspicious、
+     去掉厂商 99.96% 判 malicious；v2 live 的威胁记录去掉厂商后，99.8% 的 suspicious 也判成 malicious。原样输入时 p(malicious)
+     区分两类的 AUC 是 0.518（ASA 0.446、VPC 0.538）。
+  5. 单条记录分不开。分类器文档在 v2 live 的 114,521 条威胁记录里只有 127 种，99.6% 的 malicious 与 suspicious 文档相同，
+     按每种文档的多数标签最多判对 5.5%；LLM 的输入有 63,788 种，最多判对 36.5%。用 v2 的标签训练（07-26 训练、之后测试，
+     malicious 占 7.3%）：AUC 0.857 / 0.883 / 0.888（分类器文档 / LLM 输入 / 原始字段含 IP），平均精度 0.24–0.29，精度 ≥ 50%
+     时召回为 0，按 0.5 判 malicious 的互判都比全判 suspicious 多（分类器文档 4,892 对 4,468）。AUC 主要来自 ASA 的方向：
+     outside 进来的拦截 malicious 占 34.9%，dmz-2 出去的占 0.4%。随机 80/20 划分的平均精度也只有 0.37–0.50。
+  6. 只用此前记录计算的 IP 对 / 源 / 目的出现次数，在 ASA 入站拦截内 AUC 0.56–0.65，VPC 内 0.44–0.48。live 的 1,584 个事件
+     中位数只有 1 行（90% 不超过 4 行），只有 10 个出现在 incident_signals 里；malicious 中 5,779 行处置为 Disrupted。
+  7. 威胁发现能泛化，因为 benign / 威胁的分界是单条记录的规则命中：v2 live 中 action 为 block 的 114,310 行全是威胁；train 里
+     ASA Deny 和 VPC REJECT 记录也全是威胁（78,748 malicious、44,679 suspicious）。
+  8. 路由没触发：v2_live 的 43 行 malicious 置信度都 ≥ 0.983，(来源, suspicious) 在 train 里见过。告警类型本来由分类器决定，
+     编码手册里 malicious 的描述就是“没有厂商和产品元数据”的拦截记录。
+- **结论**：v2 上失效的是 malicious 的定义，不是模型的缺陷。suspicious / malicious 的分界是“是否被关联进事件”，单条日志里
+  没有；比赛数据通过“没有厂商字段”把它写进了记录，分类器和编码手册学到的都是这条构造痕迹。泄漏审计挡住了时间和伪名，
+  却把厂商字段当成了正常内容；去掉厂商字段也救不回来，只会把 suspicious 推成 malicious。valid 按 v4 的方式构造，这条
+  捷径在那里成立；要在 v2 这类数据上细分，需要事件关联的结果。
+- **产物**：`src/soc_hybrid/v2_failure.py`、`artifacts/hybrid/v2_failure/summary.json`。
