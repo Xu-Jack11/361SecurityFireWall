@@ -714,3 +714,37 @@ max_features=120k、min_df=3、torch GPU 后端（T4）。
   却把厂商字段当成了正常内容；去掉厂商字段也救不回来，只会把 suspicious 推成 malicious。valid 按 v4 的方式构造，这条
   捷径在那里成立；要在 v2 这类数据上细分，需要事件关联的结果。
 - **产物**：`src/soc_hybrid/v2_failure.py`、`artifacts/hybrid/v2_failure/summary.json`。
+
+## I21 · 训练时去掉厂商字段（2026-10-09）
+
+- **问题**：I20 显示分类器靠“没有厂商字段”判 malicious。如果训练时就去掉厂商和产品字段，能不能学到可迁移的区分方法？
+- **方法**（`python -m soc_hybrid.vendor_blind`，valid 由 `python -m soc_hybrid.evaluate --runs vendor_blind,cost2` 评分）：
+  分类器文档去掉 `fvendor_*`、`fproduct_*` 两个标记，其余不变（TextCNN + TF-IDF 平均，按行加权，每格最多 20,000 个文档，
+  m = 2 最小代价），重新训练后与原分类器比较，都不接 LLM（告警类型本来就由分类器决定）。外部数据用 I19 的抽样（每组 10,000 行，
+  种子 0）和 v2 的全部威胁记录。这是事后实验，没有据此改动最终方案。
+- **结果**：
+
+  | 数据 | 版本 | 威胁漏报 | 误报 | 互判 | malicious 召回 | macro-F1 | 代价 m2 / m5 / m10 |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | valid | 原分类器 | 430 | 34 | 24 | 96.8% | 0.9943 | 906 / 2,196 / 4,346 |
+  | valid | 去掉厂商 | 84 | 91 | 8,892 | 36.2% | 0.8105 | 4,705 / 4,957 / 5,377 |
+  | v4 抽样 | 原 / 去掉 | 1 / 1 | 0 / 0 | 1 / 46 | 99.7% / 93.6% | 0.9988 / 0.9570 | |
+  | latest 抽样 | 原 / 去掉 | 2 / 1 | 0 / 0 | 0 / 65 | 99.7% / 94.0% | 0.9995 / 0.9405 | |
+  | v2_live 抽样 | 原 / 去掉 | 0 / 0 | 0 / 74 | 43 / 55 | 0% / 23.3% | 0.6543 / 0.6938 | |
+  | v2_incident 抽样 | 原 / 去掉 | 0 / 0 | 0 / 0 | 9,701 / 455 | 3.0% / 95.5% | 0.0581 / 0.9767 | |
+
+  1. 改学的线索：train 的威胁里，去掉厂商后只有 5.9% 的 malicious 与 suspicious 文档相同。TF-IDF 最强的 malicious 特征是
+     ASA 的方向和接口（`src outside`、`dst inside`、`group dmz`），train 里从 outside 进来的拦截 93.5% 是 malicious
+     （77,740 对 5,418）；suspicious 一侧是出站方向（`src dmz`、`dst outside`）、`reject ok`（VPC）、认证失败和脱敏伪名的组合（`zcred zcred`、
+     `group zuser`）。
+  2. valid 变差：malicious 中 PAN 6,038 行、VPC 2,664 行在 train 里从没以 malicious 出现（PAN 完全没有），原分类器靠无厂商
+     判对，去掉厂商后全部判成 suspicious；ASA 的 5,112 行判对 5,086 行。
+  3. v2 没有变好：v2_incident 多是入站拦截，召回升到 95%；v2 live 中入站拦截只有 34.9% 是 malicious，模型把 5,805 行入站
+     suspicious 中的 3,819 行判成 malicious，全部 114,521 条 live 威胁记录的互判从 7,735 升到 8,831，p(malicious) 的 AUC 0.47
+     （ASA 0.914、VPC 0.571）；抽样中多出 74 条误报（benign 来源失去了厂商标记）。
+  4. 威胁漏报反而下降（valid 430 → 84）：原分类器把 334 行无厂商的 PAN 记录判成 benign（train 里也有无厂商的 benign）。
+     这是在 valid 上看到的，没有据此改方案。
+- **结论**：去掉厂商字段，分类器换成学“入站拦截 = malicious”这类数据构成上的差异，比赛数据上细分大幅变差，v2 live 也更差，
+  证实了 I20 的两难：单条记录里既没有比赛数据之外也成立的 malicious 线索，也没有 v2 的事件关联信息。
+- **产物**：`src/soc_hybrid/vendor_blind.py`、`artifacts/hybrid/vendor_blind/summary.json`、`artifacts/hybrid/runs/vendor_blind/`
+  （`docs.parquet`、`scores.json`）、`models/*_novendor.joblib`。
