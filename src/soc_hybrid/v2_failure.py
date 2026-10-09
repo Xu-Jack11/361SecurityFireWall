@@ -12,12 +12,16 @@ incident_ids), which the competition data do not carry, and never touches valid:
   separable    whether a single v2 record separates malicious from suspicious: shared views, the in-sample best
                any function of a view can do, TF-IDF models fitted on v2's own labels, past-only context counts
   system       what the routing triggers saw in the I19 run (artifacts/hybrid/external/*_rows.parquet)
+  leads        why identical v2 records carry both labels: the dataset card calls a row malicious only if Precinct
+               attached that artifact to an incident as a lead, and Precinct attaches few records of a repeated activity
 
-python -m soc_hybrid.v2_failure  → artifacts/hybrid/v2_failure/summary.json
+python -m soc_hybrid.v2_failure [--parts leads,...]  → artifacts/hybrid/v2_failure/summary.json
+(--parts reruns only the named parts and keeps the others' saved results)
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 
 import numpy as np
@@ -260,47 +264,107 @@ def system() -> dict:
     return report
 
 
+def leads() -> dict:
+    """Leads per incident, identical non-lead twins of each lead, and the bursts behind incidents with ~100 leads."""
+
+    live = pd.read_parquet(GROUPS["v2_live"], columns=COLUMNS + ["timestamp", "incident_ids"])
+    threats = live[live["label_binary"] != "benign"].reset_index(drop=True).astype({c: object for c in COLUMNS})
+    text = threats[["pipeline", "vendor_name", "product_name"]].fillna("").astype(str)
+    threats["view"] = text["pipeline"] + "|" + text["vendor_name"] + "|" + text["product_name"] + "|" + llm_messages(threats)
+    malicious = threats["label_binary"].eq("malicious").to_numpy()
+    suspicious = threats.loc[~malicious]
+    twins = suspicious.groupby("view").size()
+    per_row = threats.loc[malicious, "view"].map(twins).fillna(0)
+    linked = threats.loc[malicious].assign(incident=lambda d: d["incident_ids"].map(json.loads)).explode("incident")
+    per_incident = linked.groupby("incident").size()
+    counts = per_incident.value_counts()
+    between = lambda low, high: int(counts[(counts.index >= low) & (counts.index <= high)].sum())
+    report = {
+        "incidents": int(len(per_incident)),
+        "leads_per_incident": {"1": between(1, 1), "2": between(2, 2), "3-98": between(3, 98), "99": between(99, 99),
+                               "100": between(100, 100), "over 100": between(101, 10**9)},
+        "malicious_rows_with_identical_suspicious_twin": round(float((per_row > 0).mean()), 3),
+        "identical_suspicious_twins_per_malicious_row_median": float(per_row.median()),
+        "busiest_lead_activities": [
+            {"view": view[:220], "malicious": int(group["label_binary"].eq("malicious").sum()),
+             "suspicious": int(twins.get(view, 0))}
+            for view, group in threats[threats["view"].isin(per_row.nlargest(3).index.map(threats.loc[malicious, "view"].get))]
+            .groupby("view")],
+    }
+    # Incidents holding about 100 leads: their leads come from one short burst; count the records of the same
+    # source and destination inside that burst that were not attached.
+    spans, left = [], []
+    for incident in per_incident[per_incident.between(99, 100)].index:
+        members = linked[linked["incident"] == incident]
+        low, high = members["timestamp"].min(), members["timestamp"].max()
+        pairs = set(zip(members["src_ip"], members["dst_ip"]))
+        window = suspicious[suspicious["timestamp"].between(low, high)]
+        spans.append(high - low)
+        left.append(sum(pair in pairs for pair in zip(window["src_ip"], window["dst_ip"])))
+    report["incidents_with_99_or_100_leads"] = {"incidents": len(spans),
+                                                 "lead_span_seconds_median": round(float(np.median(spans)), 1),
+                                                 "same_pair_suspicious_inside_span_median": float(np.median(left))}
+    return report
+
+
+PARTS = ("labels", "same_events", "swap", "separable", "system", "leads")
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--parts", default=",".join(PARTS))
+    parts = set(parser.parse_args().parts.split(","))
     RESULTS.mkdir(parents=True, exist_ok=True)
-    summary = {"labels": labels()}
-    for group in ("train", "v4", "latest", "v2_live", "v2_incident"):
-        print(f"== {group}")
-        for label, entry in summary["labels"][group].items():
-            print(f"   {label:10s} {entry}")
-    print("   v2 live incidents:", summary["labels"]["v2_live_incidents"])
+    path = RESULTS / "summary.json"
+    summary = json.loads(path.read_text(encoding="utf-8")) if path.exists() and parts != set(PARTS) else {}
 
-    pairs_report, old, new = same_events()
-    summary["same_events"] = pairs_report
-    print("\n== same events:", {k: v for k, v in pairs_report.items() if k != "example"})
-    print("   v4:", pairs_report["example"]["v4"])
-    print("   v2:", pairs_report["example"]["v2"])
+    if "labels" in parts:
+        summary["labels"] = labels()
+        for group in ("train", "v4", "latest", "v2_live", "v2_incident"):
+            print(f"== {group}")
+            for label, entry in summary["labels"][group].items():
+                print(f"   {label:10s} {entry}")
+        print("   v2 live incidents:", summary["labels"]["v2_live_incidents"])
 
-    models = load_models()
-    summary["swap"] = swap(models, old, new)
-    print("\n== swap (paired events)")
-    for name, entry in summary["swap"]["pairs"].items():
-        print(f"   {name:34s} {entry}")
-    for name, entry in summary["swap"]["threat_rows"].items():
-        print(f"   {name:24s} {entry}")
-    if getattr(models[0], "net", None) is not None:
-        import torch
+    if parts & {"same_events", "swap"}:
+        pairs_report, old, new = same_events()
+        summary["same_events"] = pairs_report
+        print("\n== same events:", {k: v for k, v in pairs_report.items() if k != "example"})
+        print("   v4:", pairs_report["example"]["v4"])
+        print("   v2:", pairs_report["example"]["v2"])
+        if "swap" in parts:
+            models = load_models()
+            summary["swap"] = swap(models, old, new)
+            print("\n== swap (paired events)")
+            for name, entry in summary["swap"]["pairs"].items():
+                print(f"   {name:34s} {entry}")
+            for name, entry in summary["swap"]["threat_rows"].items():
+                print(f"   {name:24s} {entry}")
+            if getattr(models[0], "net", None) is not None:
+                import torch
 
-        models[0].net.to("cpu")
-        torch.cuda.empty_cache()
+                models[0].net.to("cpu")
+                torch.cuda.empty_cache()
 
-    summary["separable"] = separable()
-    print("\n== separable")
-    for view, entry in summary["separable"]["views"].items():
-        print(f"   view {view}: {entry}")
-    print("   ASA source zone:", summary["separable"]["asa_source_zone"])
-    for split, views in summary["separable"]["in_domain"].items():
-        for view, entry in views.items():
-            print(f"   {split:22s} {view:4s} {entry}")
-    print("   past-only context AUC:", summary["separable"]["context"])
+    if "separable" in parts:
+        summary["separable"] = separable()
+        print("\n== separable")
+        for view, entry in summary["separable"]["views"].items():
+            print(f"   view {view}: {entry}")
+        print("   ASA source zone:", summary["separable"]["asa_source_zone"])
+        for split, views in summary["separable"]["in_domain"].items():
+            for view, entry in views.items():
+                print(f"   {split:22s} {view:4s} {entry}")
+        print("   past-only context AUC:", summary["separable"]["context"])
 
-    summary["system"] = system()
-    print("\n== I19 system:", summary["system"])
-    (RESULTS / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    if "system" in parts:
+        summary["system"] = system()
+        print("\n== I19 system:", summary["system"])
+
+    if "leads" in parts:
+        summary["leads"] = leads()
+        print("\n== leads:", json.dumps(summary["leads"], indent=1, ensure_ascii=False))
+    path.write_text(json.dumps(summary, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
 
 
 if __name__ == "__main__":

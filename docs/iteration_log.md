@@ -768,3 +768,21 @@ max_features=120k、min_df=3、torch GPU 后端（T4）。
   多出信息；LLM 读到的信息不会多于这些特征，难以超过用 v2 标签训练的模型。要细分 v2 的 malicious，需要 Precinct 的事件
   关联结果本身。在比赛数据上，同样的聚合等于把时间和实体泄漏带回来（I16 审计）。
 - **产物**：`src/soc_hybrid/v2_context.py`、`artifacts/hybrid/v2_context/summary.json`。
+
+## I23 · v2 中内容相同、标签不同的原因（2026-10-09）
+
+- **问题**：v2 里 64% 的 malicious 记录都有 LLM 输入逐字相同的 suspicious 记录，为什么同样的数据有两种标签？
+- **官方说明**（[数据卡 v2.1.0](https://huggingface.co/datasets/witfoo/precinct6-cybersecurity/blob/v2.1.0/README.md)、
+  [生成代码 docs/labeling.md](https://github.com/witfoo/dataset-from-precinct6/blob/main/docs/labeling.md)）：malicious =
+  “the event is a triggering signal (lead) of a Precinct incident”，在 signals 中按 `artifact_id` 与事件对应；suspicious =
+  命中 261 条 lead 检测规则之一但不是任何事件的 lead；benign = 没命中规则、也不属于任何事件。“All labels derive from WitFoo
+  Precinct's automated incident correlation engine — there is no independent, analyst-verified ground truth.” 说明里没有讲
+  Precinct 如何挑选 lead，也没有直接讨论同内容不同标签。
+- **数据核对**（`python -m soc_hybrid.v2_failure --parts leads`）：标签按单条记录（artifact）认定。1,584 个 live 事件中 1,092 个只挂
+  1 条 lead、260 个挂 2 条、210 个挂 3–98 条、19 个挂 99–100 条、3 个超过 100 条；挂 99–100 条的事件，lead 来自中位数 9 秒的突发，
+  同一时段同一对 IP 还有中位数 368 条记录没挂上。一条 ICMP 拦截（同一源 IP、同一目标）在采集期内出现 1,690 次，只有 1 次是
+  lead。malicious 记录的逐字相同 suspicious 孪生记录中位数 51 条。
+- **结论**：同内容不同标签不是导出错误，而是标签定义的结果：“是不是被挂为事件的 lead”取决于 Precinct 的挑选（大多只挂
+  一条，多的挂到约 100 条为止），这个选择不由记录内容决定。所以 v2 中 suspicious 和 malicious 在同一活动内部的区分，
+  任何模型都做不到；若要可学，可以把“产生过 lead 的活动”整体视为 malicious，但那是另一种任务定义。
+- **产物**：`src/soc_hybrid/v2_failure.py`（新增 `leads` 部分和 `--parts` 选项）、`artifacts/hybrid/v2_failure/summary.json`。
