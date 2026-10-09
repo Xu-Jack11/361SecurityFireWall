@@ -104,7 +104,8 @@ to the corrected-rule fusions, and `--budget 0` sends every triggered document t
 `data/external` group and scores them there; `python -m soc_hybrid.v2_failure` (I20) explains why v2's malicious rows
 come out suspicious (v2 labels incident links; the competition's malicious rows are the same events exported without
 vendor fields, which is what the classifier keys on), and `python -m soc_hybrid.vendor_blind` (I21) refits the
-classifier without vendor fields (scored on valid by `soc_hybrid.evaluate --runs vendor_blind`). LLM replies are
+classifier without vendor fields (scored on valid by `soc_hybrid.evaluate --runs vendor_blind`); `soc_hybrid.v2_context`
+(I22) tests grouping v2 records by source before judging them. LLM replies are
 cached in `artifacts/hybrid/llm/*.jsonl`.
 vLLM must be started from a script or module, not stdin (it spawns workers), and
 `soc_hybrid.llm` pins `VLLM_PORT` above the ephemeral range because proxy

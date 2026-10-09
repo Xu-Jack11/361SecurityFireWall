@@ -748,3 +748,23 @@ max_features=120k、min_df=3、torch GPU 后端（T4）。
   证实了 I20 的两难：单条记录里既没有比赛数据之外也成立的 malicious 线索，也没有 v2 的事件关联信息。
 - **产物**：`src/soc_hybrid/vendor_blind.py`、`artifacts/hybrid/vendor_blind/summary.json`、`artifacts/hybrid/runs/vendor_blind/`
   （`docs.parquet`、`scores.json`）、`models/*_novendor.joblib`。
+
+## I22 · v2 上先按来源聚合再判断（2026-10-09）
+
+- **问题**：v2 的 malicious 是事件层面的标签。先把同一来源的记录聚在一起、再让 LLM 看整组判断，能不能分出 malicious？
+- **方法**（`python -m soc_hybrid.v2_context`，只读 v2 自己的标签）：在 v2 live 的威胁记录上，(1) 看 Precinct 事件的成员共享什么；
+  (2) 按源 IP、源 IP × 1 小时、源 IP × 10 分钟、源 + 目的 IP × 1 小时、目的 IP × 1 小时分组，统计组内标签混杂程度，并用“事后
+  按每组多数标签来判”作为一组一个结论的上限（读整组的 LLM 也受它约束）；(3) 07-26 训练、之后测试，比较只看单条内容
+  （TF-IDF，LLM 看到的文本）、只看同源上下文（同一源 IP / 目的 IP 一小时内的记录数、拒绝数、入站数、目标数、端口数、跨度，
+  按全部记录计算，不用标签）和两者合并（梯度提升，内容分数在 07-26 内交叉拟合）。
+- **结果**：
+  1. 有 2 条以上 live 记录的 492 个事件里，只有 28.7% 来自同一源 IP，42.1% 指向同一目的 IP，98.8% 来自同一产品。
+  2. 组内混杂：按源 IP 分组，97.8% 的 suspicious 记录所在的组里也有 malicious，只有 8.1% 的 malicious 落在全是 malicious 的组里；
+     缩到 10 分钟也只有 17.2%。按组多数标签的上限：源 IP 27.3%、源 IP × 1 小时 32.8%、源 IP × 10 分钟 34.3%、源 + 目的 IP × 1 小时
+     35.2%、目的 IP × 1 小时 24.4%；其中 ASA 为 53–76%，VPC 全部为 0（VPC 的 malicious 所在的组总是 suspicious 占多数）。
+  3. 可分性（测试 61,142 行，malicious 占 7.3%）：只看内容 AUC 0.887、平均精度 0.286；只看同源上下文 0.890、0.294；合并 0.898、
+     0.288。三者精度 ≥ 50% 时的召回都 ≤ 0.003。ASA 内平均精度 0.31–0.34，VPC 内 0.26–0.28。
+- **结论**：在 v2 上按来源聚合不可行。同一来源的记录两类混杂，事件本身不是按来源组织的，同源上下文也没有在单条内容之外
+  多出信息；LLM 读到的信息不会多于这些特征，难以超过用 v2 标签训练的模型。要细分 v2 的 malicious，需要 Precinct 的事件
+  关联结果本身。在比赛数据上，同样的聚合等于把时间和实体泄漏带回来（I16 审计）。
+- **产物**：`src/soc_hybrid/v2_context.py`、`artifacts/hybrid/v2_context/summary.json`。
