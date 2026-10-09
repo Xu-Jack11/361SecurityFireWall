@@ -4,6 +4,12 @@
 除特别说明外，所有训练均为标准配置：300k 分层采样、TF-IDF 1–2 gram、
 max_features=120k、min_df=3、torch GPU 后端（T4）。
 
+> **术语说明（2026-10-08）**：`data/valid_input.parquet` 是**验证集**，不是比赛测试集
+> （答案在 `valid_answer_private.parquet`，见 I11）。I11 之前的记录把它叫作“测试集”，
+> 原文保留未改。各版本在 valid 上的预测文件沿用了 `res*.csv` 的命名，
+> 但它们都不是提交文件。之后在 valid 上的运行写入 `predictions.csv` / `valid_pred.csv`，
+> `res.csv` 只留给真正测试集的提交。
+
 ## I1 · 基线实现（≤ 2026-07-09）
 
 - **内容**：`src/soc_baseline/` 完整流水线——分层采样 → `build_log_documents`
@@ -411,3 +417,230 @@ max_features=120k、min_df=3、torch GPU 后端（T4）。
      但这是看了外部测试数据之后才发现的，修完之后 v2 live 就不再是独立测试。
 - **产物**：`scripts/eval_external.py`、`artifacts/external_eval/results.json`、
   `artifacts/external_eval/malicious_recall_by_source.csv`。
+
+## I15 · 本地 LLM 零样本推理与路由（2026-10-07）
+
+- **动机**：TF-IDF 模型只认识 train 里出现过的日志格式。G 在 valid 上的 864 个错误中，
+  801 个是 Crowdstrike 资产记录：train 里 Crowdstrike 只有 35 行，而且全是 suspicious。
+  这次试验想知道：让开源 LLM 先读懂日志、推理一遍再给标签，能不能处理格式不同的日志。
+- **环境**：单张 T4（15 GB，不支持 bf16 和 FlashAttention2）。模型用 Qwen3.5-4B
+  （2026-02 发布，fp16 权重约 8 GB）。更新的 Qwen3.8-27B、GLM-5.3 等单卡放不下。
+  - 权重从 ModelScope 直连下载，约 80 MB/s；默认代理不到 1.4 MB/s。
+  - vLLM 0.19 在 T4 上要设 `max_num_seqs=32`、`max_num_batched_tokens=1024`、
+    `gpu_memory_utilization=0.80`。原因是 Qwen3.5 线性注意力层的每序列状态，以及
+    prefill 时的临时显存，vLLM 的 profiling 估不到，用默认参数会 OOM。
+  - 每次启动要做 kernel autotune，第一次约 6 分钟。
+- **做法**：`scripts/llm_reasoning_probe.py`，零样本。
+  - prompt 里只有三个标签的书面定义，没有任何训练样例；输入是结构化字段加消息正文。
+    正文里的日期、时间、epoch、年份全部掩码，IP 和端口保留。
+  - 要求模型先简短推理，再输出一行 JSON，字段为 label、verdict、event_type、confidence。
+  - 探针样本共 864 行：
+    - train：每个（来源, 标签）格子先按 timefree 模板去重，再补充其他不同的消息。
+      每格 benign 取 12 行、suspicious 40 行、malicious 120 行，无厂商 benign 取 40 行。
+    - valid：选 TF-IDF 没见过或很少见的格式，包括 Palo Alto TRAFFIC、Crowdstrike、
+      Graph、DLP、Duo，再加上无厂商的行。
+    - valid 答案只用来抽样和打分。
+  - 两种模式都跑了一遍：
+    - thinking：用官方推荐的 thinking 采样参数，生成上限 6,144 token。
+    - no-thinking：不开 thinking，模型只在回答里写几句推理。
+- **探针结果**（valid 各组的准确率；括号内是“是否判为告警”的准确率）：
+
+  | 分组 | 行数 | no-thinking | thinking | G |
+  | --- | --- | --- | --- | --- |
+  | Crowdstrike benign（资产记录） | 60 | **1.00** | 0.98 | 0.00 |
+  | Crowdstrike suspicious（检测） | 60 | 0.60（1.00） | 0.80（0.93） | 1.00 |
+  | Palo Alto drop（malicious） | 60 | 0.00（1.00） | 0.00（1.00） | 1.00 |
+  | 无厂商的其他 malicious | 60 | 0.02（0.92） | 0.00（0.93） | 0.87 |
+  | Graph / Duo / 无厂商 benign | 90 | 1.00 | 1.00 | 1.00 |
+  | Symantec DLP（suspicious） | 5 | 0.00 | 0.00 | 0.00 |
+  | **valid 合计，是否判为告警** | 336 | **0.970** | 0.961 | 0.783（F 0.569） |
+
+  - train（零样本）：
+    - 15 个 benign 来源中有 11 个准确率不低于 0.92。
+    - ASA、VPC、Precinct、Duo 的 suspicious 全部判对。
+    - malicious 一条也没判出来：带拦截判决的 64 条全判成 suspicious，不带判决的 56 条
+      Meraki flow 记录全判成 benign。
+  - LLM 自己抽取的 verdict 和 `firewall_action` 正则基本一致：正则判为 block 的
+    268 行中，LLM 也判为 block 的有 265 行。
+- **thinking 与 no-thinking 对比**：
+
+  | | no-thinking | thinking |
+  | --- | --- | --- |
+  | 每条平均生成 token | 171 | 2,916 |
+  | 864 行耗时 | 28 分钟 | 约 3 小时 |
+  | 因超长被截断、没给出答案 | 1 行 | 14 行 |
+  | train 三分类准确率 / 告警准确率 | 0.695 / 0.843 | 0.706 / 0.837 |
+  | valid 三分类准确率 / 告警准确率 | 0.560 / 0.970 | 0.589 / 0.961 |
+
+  两种模式的预测 92.7% 一致。thinking 改善了 AD suspicious（0.80 → 0.98），但更容易
+  把 benign 判成告警（Barracuda WAF 1.00 → 0.83，Windows Logs 1.00 → 0.92）。
+  它对 malicious 和 DLP 都没有帮助。
+- **路由 R**（`route` 子命令）：
+  - 规则只依据 train：训练行数少于 100 的来源（也就是 G 的来源掩码不做限制的那些）
+    交给 no-thinking 的 LLM，其余行仍用 G。
+  - LLM 判出的 malicious 改成 suspicious。依据是 train 探针中，LLM 判为 malicious
+    的全是 Crowdstrike 检测记录，而这些记录的标签是 suspicious。
+  - valid 中被路由的有 1,303 行：Crowdstrike 892、Graph 200、Barracuda ESS 168、
+    Apache 34、DLP 9。LLM 推理耗时约 1 小时。结果在 `artifacts/llm_probe/route_scores.json`：
+
+  | 版本 | 是否用时间 | macro-F1 | 错误行数 |
+  | --- | --- | --- | --- |
+  | G | 否 | 0.99598 | 864 |
+  | G + benign 权重 10（w=10 是对着答案扫出来的） | 否 | 0.99895 | 150 |
+  | **R = G + LLM 路由** | 否 | **0.99916** | **99** |
+
+  - 改善来自 Crowdstrike：892 行全部判对，包括 G 判错的 801 行 benign 和 91 行 suspicious。
+  - R 剩下的 99 个错误：
+    - 54 条早期 malicious：没有判决词，和 G 相同。
+    - 9 条 DLP：正文其实是 winlogbeat 的进程创建日志。
+    - 36 条 Barracuda ESS benign 被判成 suspicious：都是被拦截的垃圾邮件
+      （`"blocked":true`，taxonomy=spam）。按 prompt 的定义，“安全控制拦截了东西”
+      就是 suspicious，但答案标的是 benign。G 在这 36 条上是对的。
+- **结论**：
+  1. LLM 零样本就能跨格式判断“是不是告警”。它对新格式的识别正好补上 TF-IDF 的盲区，
+     在 valid 的格式迁移组上，告警准确率 0.97，G 只有 0.78。
+  2. malicious 仍然判不出来。比赛的 malicious 指无厂商的历史攻击记录，由数据集的构造
+     方式决定，单条日志的内容里没有这个信息。DLP、ESS 垃圾邮件也属于标签定义和内容
+     对不上的情况。这些都不是推理能力不够，thinking 也解决不了。
+  3. 单条日志分类不值得开长推理：token 多 17 倍，准确率基本持平，还会有截断。
+  4. 推荐的组合是 R：已知格式用 G，稀有或未见过的来源交给 LLM。R 不依赖时间，也不需要
+     对着答案调权重，错误数比 G + w10 还少。但 LLM 不能处理全部行：在已知的大流量格式上，
+     它有几个百分点的误判（例如 ESS），放到全量数据上会变成成千上万行错误。
+  5. **这不是盲测**：路由的思路来自 I11/I13 对 Crowdstrike 的分析，以及这次探针在 valid
+     上的结果。不过路由阈值沿用了来源掩码原有的 100 行，malicious → suspicious 的映射
+     只依据 train，prompt 也没有因为 valid 的结果改过。
+  6. **下一步候选**：
+     - 从 train 里归纳标签定义，或者从 train 取 few-shot 示例。例如 train 里 74 行 ESS
+       全部是 benign，其中 12 行 taxonomy=spam，可以把“垃圾邮件过滤属于例行操作”写进定义。
+     - 把同一主机或会话的邻近事件拼进 prompt，在 v2 live 上评估跨事件上下文。
+     - 在格式差异更大的外部数据上评估路由。
+- **产物**：
+  - `scripts/llm_reasoning_probe.py`
+  - `artifacts/llm_probe/`：
+    - `sample.parquet`
+    - `Qwen3.5-4B/`：thinking 模式
+    - `Qwen3.5-4B-nothink/`：含 `res_route.csv`
+    - `route_scores.json`
+    - `run_*.log`
+
+## I16 · 分类器 + LLM 混合方案：只用 train、防泄漏、benign 优先（2026-10-08）
+
+- **动机**：重新设计一套“分类器 + LLM”的方案，不借助 I1–I15 的任何模型、规则、掩码或预测：只用 train
+  训练，在 valid 上验证，避免数据泄漏，优先保证 benign 不被漏判。完整的调研报告（含消融与解释）：
+  https://claude.ai/code/artifact/d297228a-b907-42ea-8b9e-6af8df21e987
+- **防泄漏**（只用 train 审计，`artifacts/hybrid/audit.json`）：时间戳、event_id、被脱敏器写进伪名的年份
+  （单独出现的 `USER-9564` 在 51,756 行 malicious、385 行 benign 上）都与标签完全对齐。分类器视图把伪名
+  换成类型、数字串换成 0、屏蔽月份和星期词；LLM 视图只屏蔽时间和伪名。对 20,000 条消息随机改写数字和
+  月份后，分类器文档 0 处变化。
+- **train 内部验证**：文档 5 折（ud5）、来源留出（18 折）、(来源, 标签) 格子留出（10 折）；第二轮起加入
+  LSA 聚类 5 折（cl5，300 簇，留出文档的新颖度分布接近 valid 输入）。LLM 在留出上用去掉被留出格子条目的
+  编码手册评估。配置按“0.99 × 同分布代价 + 0.01 × 分布外代价”在每折同权和按文档合并两种口径下取 minimax。
+- **最终方案（第四轮）**：TextCNN 与 TF-IDF（按行加权）的概率平均，benign 权重 w = 10；新来源优先、按
+  新颖度（LSA 最近邻余弦）取 2,000 条交给 Qwen3.5-4B（零样本，train 编码手册，读标签 token 概率）；LLM 以
+  10 倍阈值决定 benign 还是告警，告警类型和 malicious 判定来自分类器。
+- **valid 结果**：
+
+  | 轮次 | 要点 | macro-F1 | benign 漏判 | 错误行数 |
+  | --- | --- | --- | --- | --- |
+  | 1 | TF-IDF 文档加权，w = 300、wl = 300，train 网格（ud5） | 0.839 | 0 | 9,999 |
+  | 2 | TextCNN，w = 100，train 网格（cl5） | 0.843 | 0 | 8,994 |
+  | 3 | TextCNN，w = wl = 10，新颖度路由 | 0.873 | 0 | 7,751 |
+  | 4（最终） | TextCNN + TF-IDF 平均，w = wl = 10 | 0.870 | 0 | 7,884 |
+
+  只有第一轮是严格的留出结果；第二到四轮都受到前一轮 valid 结果的启发，参数仍然只来自 train 或事先定下的
+  代价比。最终方案的 LLM 改了 1,108 行，全部正确。
+- **结论**：
+  1. train 内部的网格搜索会选出很高的 benign 权重（来源和格子留出把 benign 漏判按 10 倍计），而 valid 里
+     漏掉的 malicious（无厂商的 Palo Alto TRAFFIC drop、VPC REJECT）在分类器上只有 0.33–0.43 的 malicious
+     概率，高权重把它们压成了 benign。
+  2. LLM 在被送对地方时很有效：按分类器置信度路由（事后）时它改对 7,366 行，macro-F1 0.979，代价是 34 行
+     benign 漏判（全是 ASA 的 “denied by ACL” 记录）；按新颖度路由只覆盖分类器 13% 的错误；随机路由几乎没有
+     收益（代价 9,016，只用分类器是 8,992）。两种路由信号对应两种偏移，组合路由需要新的测试集验证。去掉 train
+     编码手册后，LLM 补报的告警从 1,108 降到 884（macro-F1 0.865）。
+  3. benign 优先必须在两侧同时成立：LLM 侧不用 10 倍阈值会多 1,411 行 benign 误报；换成 Qwen3-4B-Instruct-2507
+     即使阈值相同也多 1,986 行。Qwen3.5-4B 在 T4 上约 43 条/分钟，是路由预算的瓶颈：同样的配置把预算放到
+     3,000、4,000 条（事后），macro-F1 升到 0.930、0.951，benign 漏判仍为 0。
+- **产物**：
+  - `src/soc_hybrid/`：`text.py`（两种视图）、`audit.py`、`splits.py`、`models.py`（TF-IDF LR、TextCNN）、
+    `holdout.py`、`novelty.py`、`llm.py`、`llm_holdout.py`、`route_select.py`、`classifier_select.py`、
+    `pipeline.py`、`evaluate.py`、`ablation.py`、`ablation_leak.py`、`report.py`、`llm_only.py`
+  - `tests/test_hybrid.py`
+  - `artifacts/hybrid/`：`audit.json`、`holdout/`、`route_select/`、`runs/final4/res.csv`（最终配置在 valid 上的预测）、
+    各消融运行、`llm/*.jsonl`（LLM 回复缓存）
+
+## I17 · 评分规则更正：威胁优先 + 部分分，重新选型（2026-10-08）
+
+- **动机**：评分规则更正为同时考察威胁发现和三分类细分：威胁（suspicious、malicious）判成 benign 惩罚最重，
+  suspicious 与 malicious 互判给部分分。I12 和 I16 的 benign 优先针对的是相反的错误。具体分值没有给出，代价矩阵
+  写成 [[0, 1, 1], [m, 0, 0.5], [m, 0.5, 0]]（行为真实标签），m 取 2、5、10。报告按新规则改写（同一链接），
+  旧规则的四轮移到附录。
+- **决策与融合**（`decision.py`）：`min_cost` 按分类器概率取期望代价最小的标签；`cost_confidence` = 次小 /
+  （最小 + 次小）期望代价，用于置信度路由。`fuse_codes` 有三种融合：`gate_km`（LLM 以自己的 m 判 benign 或告警）、
+  `raise`（只能补报告警）、`mix_km`（LLM 与分类器的概率按比例平均后再判）；三者都保留分类器的 malicious 判定和告警类型。
+- **选择**（`soc_hybrid.cost_select`，只用 train）：沿用 I16 的框架（0.99 × cl5 + 0.01 × LOSO/LOCO，两种口径），
+  把 m 的三档也放进 minimax，共 6 个倍数。
+  1. 只看分类器（7 个候选 × 8 个决策 m）：cl5 上约 0.1% 的漏报是高置信的（AD、Crowdstrike 的 suspicious，所在簇被
+     整簇留出，威胁概率中位数 0.003），调阈值救不回来；提高决策 m 主要压低 LOSO/LOCO 的漏报。
+  2. 路由 × 融合（3 个分类器 × 5 个决策 m × 触发条件 × 融合，共 9,180 种配置）：先为新触发条件在 cl5 上补了 245 条
+     LLM 回答（`cost_select picks` → `llm_holdout --keep-previous --cl5-extra`）。选出 TextCNN + TF-IDF 按行加权平均、
+     决策 m = 2、置信度 < 0.9 或新 (来源, 标签) 组合就送 LLM、`mix_km(0.75)`；最坏倍数 1.09，不用 LLM 时最好的是 1.83。
+     cl5 路由上限取 1% 或 2% 选出同一配置。
+- **valid 结果**（`runs/cost1/valid_pred.csv`，配置选定后只运行一次）：
+
+  | 方案 | 威胁漏报 | 误报 | 互判 | 代价 m = 2 / 5 / 10 | macro-F1 |
+  | --- | --- | --- | --- | --- | --- |
+  | cost1（最终） | 239 | 34 | 24 | 524 / 1,241 / 2,436 | 0.9967 |
+  | cost1 只用分类器 | 430 | 34 | 24 | 906 / 2,196 / 4,346 | 0.9943 |
+  | I16 第四版（final4） | 7,884 | 0 | 0 | 15,768 / 39,420 / 78,840 | 0.8702 |
+
+  LLM 改了 191 行，全部是把 benign 改成告警，全部正确（被路由的 8,733 行里分类器错 199 行，融合后剩 8 行）。剩下的
+  230 行 malicious 漏报来自无厂商字段的 Palo Alto 格式流量日志、fqdn 拦截记录等，其中 220 行触发了置信度条件，但排在
+  2,000 条预算之后。
+- **消融**（`artifacts/hybrid/ablation_cost.json`，m = 10 的代价）：随机路由 4,424（比只用分类器的 4,346 还差）；告警类型
+  交给 LLM 6,702（互判 8,536 行）；预算 1,000 条 3,076；Qwen3-4B-2507 2,376；通用 prompt 2,436（164 条 LLM 标签不同，
+  最终结果不变）；分类器决策 m = 3 时 1,079、m = 10 时 9,539；只用 TF-IDF 6,507。事后更好的两个变体：按新颖度排序 436、
+  只用 TextCNN 561，按协议都选不出来。全部 7,521 条触发文档都送 LLM（事后）：390（漏报 34、误报 36、互判 28；LLM 多跑约 100 分钟，改动的 398 行里 2 行改错），说明路由条件是对的、卡住的是预算。去掉防泄漏的 TF-IDF
+  （决策 m = 2）在 valid 上漏报 1,564 行，防泄漏版 6,954 行：valid 的 malicious 同样集中在更早的日期；把 valid 的时间戳改成
+  同一时刻，它有 5,080 行预测会变。
+- **结论**：
+  1. 决策规则要对准评分：同一个分类器从 benign 优先（w = 10）改为最小代价（m = 2），valid 漏报从 8,992 行降到 430 行，
+     误报只多 34 行。
+  2. 新规则下 LLM 的价值在于补抓分类器犹豫的威胁，但必须保留否决能力（train 上只能补报时倍数 3.66），也不能决定告警类型。
+  3. 剩余误差主要由 LLM 预算和路由排序决定。更快的 Qwen3-4B-2507 在新规则下不比 Qwen3.5-4B 差，同样的时间能送约 8 倍的
+     文档。组合排序（置信度 + 新颖度）和更大的预算要在新数据上验证后再采用。
+- **产物**：`src/soc_hybrid/cost_select.py`；`decision.py`（`cost_matrix`、`min_cost`、`cost_confidence`、`fuse_codes`）；
+  `metrics.py`（威胁漏报、误报、互判、三档代价）；`pipeline.py`（`--miss-weight`、`--fusion gate_km|raise|mix_km`、
+  `--fusion-param`）；`ablation.py`（`derived_cost_variants`）；`ablation_leak.py`（最小代价决策）；
+  `artifacts/hybrid/cost_select/`、`runs/cost1/`、`runs/cost_abl_*`、`run_ablations_cost.sh`。最终配置的命令：
+
+  ```bash
+  python -m soc_hybrid.pipeline --name cost1 --classifier textcnn --weights rows \
+      --params '{"device": "cuda"}' --blend tfidf_word_lr:rows --miss-weight 2 \
+      --doubt 0.9 --pair --unseen-source --fusion mix_km --fusion-param 0.75 \
+      --budget 2000 --priority doubt
+  ```
+
+## I18 · 取消 LLM 的时间限制：不设路由上限（2026-10-09）
+
+- **动机**：时间限制取消，不确定的文档全部交给 LLM，不设上限。2,000 条上限原本是 T4 的时间预算（Qwen3.5-4B 约 43 条/分钟），
+  train 侧对应的“cl5 送 LLM 的文档不超过 2%”这条约束随之去掉。
+- **train 复查**（`cost_select`）：在 cl5 的四个区间（置信度 0.9–0.95、0.95–0.99，新颖度 0.8–0.9、0.9–0.95）均匀抽样补了
+  838 条 LLM 回答，cl5 合计 1,925 条；没有回答的路由文档改为按置信度分层折算；网格加入置信度阈值 0.95、0.99，共 15,420 种
+  配置。原 minimax 规则选出 TextCNN + TF-IDF 文档加权、m = 2、置信度 < 0.99、`gate_km(1)`（cl5 送 7.5%，倍数 1.42），但它的
+  优势来自 LOCO 里只有 12 条文档的 Duo suspicious 折（置信度 0.9 时都没路由，0.99 时全被 LLM 抓回），而且随候选集合变化。
+  `cost_select robust` 在不让小折主导的汇总方式下（去掉 30 条以下的折、按文档数开方加权）选出的都是“置信度 < 0.9 或新组合”
+  这套触发条件，原配置与最优只差不到 1%；只看按文档合并时才偏向 0.99。所以触发条件不变，只去掉上限（`--budget 0`）。
+- **valid 结果**（`runs/cost2/valid_pred.csv`）：7,521 条文档、18,967 行送 LLM，覆盖分类器 488 个错误中的 478 个。威胁漏报 34、
+  误报 36、互判 28，代价 m = 2 / 5 / 10 = 118 / 220 / 390，macro-F1 0.9991（2,000 条上限时漏报 239，代价 524 / 1,241 / 2,436）。
+  LLM 补报 398 行告警，392 行完全正确，4 行从漏报变成互判，2 行误报（Barracuda WAF）。这个配置此前作为事后消融
+  （`cost_abl_all_triggered`）已经跑过，结果相同。
+- **消融**（以 cost2 为基准）：五组 valid 运行（`run_ablations_cost2.sh`：Qwen3-4B-2507、只用 TF-IDF、只用 TextCNN、通用 prompt、
+  随机路由）在本条写入时仍在运行，结果补在报告的消融一节。
+- **产物**：`cost_select.py`（区间抽样、分层折算、`robust`）、`pipeline.py`（`--budget 0`）、`runs/cost2/`、
+  `run_ablations_cost2.sh`、`cost_select/routing_grid_i17.parquet`（I17 的 2% 约束网格）。最终配置的命令：
+
+  ```bash
+  python -m soc_hybrid.pipeline --name cost2 --classifier textcnn --weights rows \
+      --params '{"device": "cuda"}' --blend tfidf_word_lr:rows --miss-weight 2 \
+      --doubt 0.9 --pair --unseen-source --fusion mix_km --fusion-param 0.75 --budget 0
+  ```
