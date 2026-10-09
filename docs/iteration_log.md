@@ -634,8 +634,12 @@ max_features=120k、min_df=3、torch GPU 后端（T4）。
   误报 36、互判 28，代价 m = 2 / 5 / 10 = 118 / 220 / 390，macro-F1 0.9991（2,000 条上限时漏报 239，代价 524 / 1,241 / 2,436）。
   LLM 补报 398 行告警，392 行完全正确，4 行从漏报变成互判，2 行误报（Barracuda WAF）。这个配置此前作为事后消融
   （`cost_abl_all_triggered`）已经跑过，结果相同。
-- **消融**（以 cost2 为基准）：五组 valid 运行（`run_ablations_cost2.sh`：Qwen3-4B-2507、只用 TF-IDF、只用 TextCNN、通用 prompt、
-  随机路由）在本条写入时仍在运行，结果补在报告的消融一节。
+- **消融**（以 cost2 为基准，`artifacts/hybrid/ablation_cost2.json`，m = 10 的代价；最终方案 390）：去掉 LLM 4,346；随机送同样多的
+  7,521 条 4,875（漏报 414、误报 723，比不用 LLM 还差）；预算 2,000 条 2,436、1,000 条 3,076；Qwen3-4B-2507 1,091（漏报 12，但误报
+  949，2,000 条上限下看不出的问题）；通用 prompt 524（误报 170）；告警类型交给 LLM 4,846（malicious 判成 suspicious 8,920 行）；
+  LLM 概率占比 0.25 638；去掉否决 392（valid 上 LLM 从未否决）；分类器决策 m = 1、3、5 为 400、392、393，m = 10 为 416；只用 TF-IDF
+  3,300（互判 2,692），只用 TextCNN 390。不设上限后，判别线和是否做两个分类器的平均都不再敏感，LLM 本身（型号、编码手册）的
+  误报率成了主要差别。
 - **产物**：`cost_select.py`（区间抽样、分层折算、`robust`）、`pipeline.py`（`--budget 0`）、`runs/cost2/`、
   `run_ablations_cost2.sh`、`cost_select/routing_grid_i17.parquet`（I17 的 2% 约束网格）。最终配置的命令：
 

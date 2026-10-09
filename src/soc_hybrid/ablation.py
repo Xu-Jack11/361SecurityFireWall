@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -175,6 +176,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default="final")
     parser.add_argument("--runs", default="")
+    parser.add_argument("--output", default=None,
+                        help="result JSON (default: ablation.json, or ablation_cost.json for a corrected-rule base)")
     args = parser.parse_args()
     table, details = [], {}
     cost_rule = json.loads((RUNS / args.base / "config.json").read_text()).get("miss_weight") is not None
@@ -191,7 +194,7 @@ def main() -> None:
         table.append({**summary_row(run, result), "routed_docs": config["routed_docs"]})
         details[run] = result
     frame = pd.DataFrame(table)
-    output = OUT / ("ablation_cost.json" if cost_rule else "ablation.json")
+    output = Path(args.output) if args.output else OUT / ("ablation_cost.json" if cost_rule else "ablation.json")
     output.write_text(json.dumps({"table": table, "details": details}, indent=2, default=float), encoding="utf-8")
     pd.set_option("display.width", 200)
     print(frame.to_string(index=False))
