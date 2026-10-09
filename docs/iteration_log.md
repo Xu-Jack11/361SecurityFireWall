@@ -648,3 +648,25 @@ max_features=120k、min_df=3、torch GPU 后端（T4）。
       --params '{"device": "cuda"}' --blend tfidf_word_lr:rows --miss-weight 2 \
       --doubt 0.9 --pair --unseen-source --fusion mix_km --fusion-param 0.75 --budget 0
   ```
+
+## I19 · 外部数据集抽样测试（2026-10-09）
+
+- **方法**（`python -m soc_hybrid.external --rows 10000`）：WitFoo 四组外部数据各随机抽 10,000 行（种子 0），完整走最终方案 cost2
+  （train 上拟合的分类器、相同的触发条件、不设上限、同样的 prompt 和融合），标签只用于评分。每组另报两个新颖子集：原始正文
+  在 train 里没出现过（I14 的口径），以及分类器文档在 train 里没出现过（更严）。
+- **结果**：
+
+  | 数据组 | 样本标签（benign / suspicious / malicious） | 威胁漏报 | 只用分类器时漏报 | 误报 | 互判 | macro-F1 | 送 LLM 的文档 |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | v4 | 9,137 / 239 / 624 | 0 | 1 | 0 | 1 | 0.9990 | 41 |
+  | latest | 9,031 / 234 / 735 | 0 | 2 | 0 | 0 | 1.0000 | 154 |
+  | v2_live | 9,400 / 557 / 43 | 0 | 0 | 0 | 43 | 0.6543 | 129 |
+  | v2_incident | 0 / 0 / 10,000 | 0 | 0 | 0 | 9,701 | 0.0581 | 450 |
+
+- **结论**：
+  1. 威胁发现能泛化：40,000 行里威胁零漏报、零误报；LLM 改了 3 行，正好补回分类器漏掉的 3 行威胁。
+  2. 三分类细分不能泛化到 v2：v2_live 的 43 行和 v2_incident 的 9,701 行 malicious 都被判成 suspicious。v2 的 malicious 按事件关联
+     原地标注、带着厂商字段，而按比赛数据的习惯，带厂商的拦截记录是 suspicious；I14 的时间无关基线在 v2 上同样没有 malicious 召回。
+  3. v4 和 latest 主要是 train 的事件本身：v4 的新颖行只有 78 行（全是 malicious，都报了告警）；latest 重新脱敏后有 8,175 行的分类器
+     文档是新的，结果仍然一行不错。
+- **产物**：`src/soc_hybrid/external.py`、`artifacts/hybrid/external/`（`summary.json`、各组逐行结果）、`llm/external.jsonl`。
